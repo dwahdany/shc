@@ -131,7 +131,7 @@ static const char SETUID_line[] =
 "#define SETUID %d	/* Define as 1 to call setuid(0) at start of script */\n";
 static int SETUID_flag = 0;
 static const char DEBUGEXEC_line[] =
-"#define DEBUGEXEC	%d	/* Define as 1 to debug execvp calls */\n";
+"#define DEBUGEXEC	%d	/* Define as 1 to debug exec calls */\n";
 static int DEBUGEXEC_flag = 0;
 static const char TRACEABLE_line[] =
 "#define TRACEABLE	%d	/* Define as 1 to enable ptrace the executable */\n";
@@ -175,6 +175,8 @@ struct rt_names {
 	char cc_counter_var[24];
 	char cc_buf_var[24];
 	char cc_buf_pos_var[24];
+	char xor_decode[24];
+	char xor_prefix[8];
 	unsigned int cc_consts[4];
 	int cc_rotations[4];
 	char rotl_macro[24];
@@ -230,6 +232,15 @@ static void init_rt_names(struct rt_names * n)
 	gen_rt_name(n->cc_counter_var, sizeof(n->cc_counter_var));
 	gen_rt_name(n->cc_buf_var, sizeof(n->cc_buf_var));
 	gen_rt_name(n->cc_buf_pos_var, sizeof(n->cc_buf_pos_var));
+	gen_rt_name(n->xor_decode, sizeof(n->xor_decode));
+	/* xor prefix: 2-4 lowercase chars */
+	{
+		int len = 2 + rand_mod(3);
+		int i;
+		for (i = 0; i < len; i++)
+			n->xor_prefix[i] = 'a' + rand_mod(26);
+		n->xor_prefix[len] = '\0';
+	}
 	/* env prefix: 2-4 lowercase chars */
 	{
 		int len = 2 + rand_mod(3);
@@ -294,9 +305,9 @@ static void emit_xor_string(FILE *o, const char *varname, const char *str)
 }
 
 /* Decode macro for XOR strings — decodes in place, use, then re-encode */
-static void emit_xor_decode_func(FILE *o)
+static void emit_xor_decode_func(FILE *o, const char *fname)
 {
-	fprintf(o, "static void _xd(unsigned char *s, int n, unsigned char k) {\n");
+	fprintf(o, "static void %s(unsigned char *s, int n, unsigned char k) {\n", fname);
 	fprintf(o, "\tint i; for(i=0;i<n;i++) s[i]^=k;\n");
 	fprintf(o, "}\n");
 }
@@ -381,7 +392,8 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "#include <stdlib.h>\n");
 	fprintf(o, "#include <string.h>\n");
 	fprintf(o, "#include <time.h>\n");
-	fprintf(o, "#include <unistd.h>\n\n");
+	fprintf(o, "#include <unistd.h>\n");
+	fprintf(o, "#include <dlfcn.h>\n\n");
 
 	/* ChaCha20 implementation with randomized names */
 	fprintf(o, "static unsigned char %s[32];\n", n->cc_key_var);
@@ -691,18 +703,72 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\t%s(&%s, sizeof(%s));\n", n->cc_key_mix, n->data_var, n->data_var);
 	fprintf(o, "\t%s(&mask, sizeof(mask));\n", n->cc_key_mix);
 	fprintf(o, "\t%s(&mask, sizeof(mask));\n", n->cc_crypt);
-	fprintf(o, "\tsprintf(buff, \"%s%%lx\", mask);\n", n->env_prefix);
+	/* Manual hex encoding of mask into buff, prefixed with env_prefix */
+	fprintf(o, "\t{\n");
+	fprintf(o, "\t\tconst char _ht[] = \"0123456789abcdef\";\n");
+	fprintf(o, "\t\tunsigned long _v = mask;\n");
+	fprintf(o, "\t\tchar *_bp = buff;\n");
+	/* Emit env_prefix chars individually to avoid a recognizable string */
+	{
+		int pi;
+		for (pi = 0; n->env_prefix[pi]; pi++)
+			fprintf(o, "\t\t*_bp++ = '%c';\n", n->env_prefix[pi]);
+	}
+	fprintf(o, "\t\tif (!_v) { *_bp++ = '0'; }\n");
+	fprintf(o, "\t\telse {\n");
+	fprintf(o, "\t\t\tchar _hb[20]; int _hi = 0;\n");
+	fprintf(o, "\t\t\twhile (_v) { _hb[_hi++] = _ht[_v & 0xf]; _v >>= 4; }\n");
+	fprintf(o, "\t\t\twhile (_hi > 0) *_bp++ = _hb[--_hi];\n");
+	fprintf(o, "\t\t}\n");
+	fprintf(o, "\t\t*_bp = '\\0';\n");
+	fprintf(o, "\t}\n");
 	fprintf(o, "\tstring = getenv(buff);\n");
 	fprintf(o, "#if DEBUGEXEC\n");
 	fprintf(o, "\tfprintf(stderr, \"getenv(%%s)=%%s\\n\", buff, string ? string : \"<null>\");\n");
 	fprintf(o, "#endif\n");
 	fprintf(o, "\tl = strlen(buff);\n");
 	fprintf(o, "\tif (!string) {\n");
-	fprintf(o, "\t\tsprintf(&buff[l], \"=%%lu %%d\", mask, argc);\n");
-	fprintf(o, "\t\tputenv(strdup(buff));\n");
+	/* Build value: decimal(mask) + ' ' + decimal(argc), then setenv via dlsym */
+	fprintf(o, "\t\tchar _val[64];\n");
+	fprintf(o, "\t\t{\n");
+	fprintf(o, "\t\t\tchar *_vp = _val;\n");
+	fprintf(o, "\t\t\tunsigned long _v = mask;\n");
+	fprintf(o, "\t\t\tif (!_v) { *_vp++ = '0'; }\n");
+	fprintf(o, "\t\t\telse {\n");
+	fprintf(o, "\t\t\t\tchar _db[24]; int _di = 0;\n");
+	fprintf(o, "\t\t\t\twhile (_v) { _db[_di++] = '0' + (_v %% 10); _v /= 10; }\n");
+	fprintf(o, "\t\t\t\twhile (_di > 0) *_vp++ = _db[--_di];\n");
+	fprintf(o, "\t\t\t}\n");
+	fprintf(o, "\t\t\t*_vp++ = ' ';\n");
+	fprintf(o, "\t\t\t{\n");
+	fprintf(o, "\t\t\t\tint _av = argc;\n");
+	fprintf(o, "\t\t\t\tif (!_av) { *_vp++ = '0'; }\n");
+	fprintf(o, "\t\t\t\telse {\n");
+	fprintf(o, "\t\t\t\t\tchar _db[24]; int _di = 0;\n");
+	fprintf(o, "\t\t\t\t\twhile (_av) { _db[_di++] = '0' + (_av %% 10); _av /= 10; }\n");
+	fprintf(o, "\t\t\t\t\twhile (_di > 0) *_vp++ = _db[--_di];\n");
+	fprintf(o, "\t\t\t\t}\n");
+	fprintf(o, "\t\t\t}\n");
+	fprintf(o, "\t\t\t*_vp = '\\0';\n");
+	fprintf(o, "\t\t}\n");
+	fprintf(o, "\t\t{\n");
+	fprintf(o, "\t\t\ttypedef int (*_se_t)(const char *, const char *, int);\n");
+	fprintf(o, "\t\t\t_se_t _se = (_se_t)dlsym(RTLD_DEFAULT, \"set\" \"env\");\n");
+	fprintf(o, "\t\t\t_se(buff, _val, 1);\n");
+	fprintf(o, "\t\t}\n");
 	fprintf(o, "\t\treturn 0;\n");
 	fprintf(o, "\t}\n");
-	fprintf(o, "\tc = sscanf(string, \"%%lu %%d%%c\", &m, &a, buff);\n");
+	/* Manual parsing of decimal values from string */
+	fprintf(o, "\t{\n");
+	fprintf(o, "\t\tconst char *_ps = string;\n");
+	fprintf(o, "\t\tm = 0;\n");
+	fprintf(o, "\t\twhile (*_ps >= '0' && *_ps <= '9') { m = m * 10 + (*_ps - '0'); _ps++; }\n");
+	fprintf(o, "\t\tif (*_ps == ' ') _ps++;\n");
+	fprintf(o, "\t\telse { return -1; }\n");
+	fprintf(o, "\t\ta = 0;\n");
+	fprintf(o, "\t\twhile (*_ps >= '0' && *_ps <= '9') { a = a * 10 + (*_ps - '0'); _ps++; }\n");
+	fprintf(o, "\t\tc = (*_ps == '\\0') ? 2 : 3;\n");
+	fprintf(o, "\t}\n");
 	fprintf(o, "\tif (c == 2 && m == mask) {\n");
 	fprintf(o, "\t\t%s(environ, &string[-l - 1]);\n", n->rmarg);
 	fprintf(o, "\t\treturn 1 + (argc - a);\n");
@@ -713,14 +779,19 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "void %s(void){}\n\n", n->chkenv_end);
 
 	/* XOR-encoded string support */
-	emit_xor_decode_func(o);
+	emit_xor_decode_func(o, n->xor_decode);
 
 	/* HARDENING: gets_process_name and hardening() with XOR strings */
 	fprintf(o, "#if HARDENING\n\n");
 
 	/* Emit XOR-encoded strings for hardening */
-	emit_xor_string(o, "_s_procfmt", "/proc/%d/cmdline");
-	emit_xor_string(o, "_s_opnotperm", "Operation not permitted\n");
+	{
+		char vn[32];
+		snprintf(vn, sizeof(vn), "%s_procfmt", n->xor_prefix);
+		emit_xor_string(o, vn, "/proc/%d/cmdline");
+		snprintf(vn, sizeof(vn), "%s_opnotperm", n->xor_prefix);
+		emit_xor_string(o, vn, "Operation not permitted\n");
+	}
 
 	/* Parent process whitelist — XOR encoded */
 	{
@@ -734,17 +805,17 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 		int pi;
 		fprintf(o, "#define _N_PARENTS %d\n", 13);
 		for (pi = 0; parents[pi]; pi++) {
-			char vn[16];
-			snprintf(vn, sizeof(vn), "_s_p%d", pi);
+			char vn[32];
+			snprintf(vn, sizeof(vn), "%s_p%d", n->xor_prefix, pi);
 			emit_xor_string(o, vn, parents[pi]);
 		}
 	}
 
 	fprintf(o, "\nstatic void %s(const pid_t pid, char * name) {\n", n->gets_pname);
 	fprintf(o, "\tchar procfile[BUFSIZ];\n");
-	fprintf(o, "\t_xd(_s_procfmt, _s_procfmt_n, _s_procfmt_k);\n");
-	fprintf(o, "\tsprintf(procfile, (char*)_s_procfmt, pid);\n");
-	fprintf(o, "\t_xd(_s_procfmt, _s_procfmt_n, _s_procfmt_k);\n");
+	fprintf(o, "\t%s(%s_procfmt, %s_procfmt_n, %s_procfmt_k);\n", n->xor_decode, n->xor_prefix, n->xor_prefix, n->xor_prefix);
+	fprintf(o, "\tsprintf(procfile, (char*)%s_procfmt, pid);\n", n->xor_prefix);
+	fprintf(o, "\t%s(%s_procfmt, %s_procfmt_n, %s_procfmt_k);\n", n->xor_decode, n->xor_prefix, n->xor_prefix, n->xor_prefix);
 	fprintf(o, "\tFILE* f = fopen(procfile, \"r\");\n");
 	fprintf(o, "\tif (f) {\n");
 	fprintf(o, "\t\tsize_t size = fread(name, sizeof(char), sizeof(procfile), f);\n");
@@ -760,20 +831,26 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "    char name[256] = {0};\n");
 	fprintf(o, "    %s(pid, name);\n", n->gets_pname);
 	fprintf(o, "    int ok = 0;\n");
-	fprintf(o, "    unsigned char * _plist[] = {_s_p0,_s_p1,_s_p2,_s_p3,_s_p4,_s_p5,_s_p6,_s_p7,_s_p8,_s_p9,_s_p10,_s_p11,_s_p12};\n");
-	fprintf(o, "    unsigned char _pkeys[] = {_s_p0_k,_s_p1_k,_s_p2_k,_s_p3_k,_s_p4_k,_s_p5_k,_s_p6_k,_s_p7_k,_s_p8_k,_s_p9_k,_s_p10_k,_s_p11_k,_s_p12_k};\n");
-	fprintf(o, "    int _pns[] = {_s_p0_n,_s_p1_n,_s_p2_n,_s_p3_n,_s_p4_n,_s_p5_n,_s_p6_n,_s_p7_n,_s_p8_n,_s_p9_n,_s_p10_n,_s_p11_n,_s_p12_n};\n");
+	fprintf(o, "    unsigned char * _plist[] = {");
+	{ int pi; for (pi = 0; pi < 13; pi++) { if (pi) fprintf(o, ","); fprintf(o, "%s_p%d", n->xor_prefix, pi); } }
+	fprintf(o, "};\n");
+	fprintf(o, "    unsigned char _pkeys[] = {");
+	{ int pi; for (pi = 0; pi < 13; pi++) { if (pi) fprintf(o, ","); fprintf(o, "%s_p%d_k", n->xor_prefix, pi); } }
+	fprintf(o, "};\n");
+	fprintf(o, "    int _pns[] = {");
+	{ int pi; for (pi = 0; pi < 13; pi++) { if (pi) fprintf(o, ","); fprintf(o, "%s_p%d_n", n->xor_prefix, pi); } }
+	fprintf(o, "};\n");
 	fprintf(o, "    int pi;\n");
 	fprintf(o, "    for (pi = 0; pi < _N_PARENTS; pi++) {\n");
-	fprintf(o, "        _xd(_plist[pi], _pns[pi], _pkeys[pi]);\n");
+	fprintf(o, "        %s(_plist[pi], _pns[pi], _pkeys[pi]);\n", n->xor_decode);
 	fprintf(o, "        if (strcmp(name, (char*)_plist[pi]) == 0) ok = 1;\n");
-	fprintf(o, "        _xd(_plist[pi], _pns[pi], _pkeys[pi]);\n");
+	fprintf(o, "        %s(_plist[pi], _pns[pi], _pkeys[pi]);\n", n->xor_decode);
 	fprintf(o, "        if (ok) break;\n");
 	fprintf(o, "    }\n");
 	fprintf(o, "    if (!ok) {\n");
-	fprintf(o, "        _xd(_s_opnotperm, _s_opnotperm_n, _s_opnotperm_k);\n");
-	fprintf(o, "        printf(\"%%s\", (char*)_s_opnotperm);\n");
-	fprintf(o, "        _xd(_s_opnotperm, _s_opnotperm_n, _s_opnotperm_k);\n");
+	fprintf(o, "        %s(%s_opnotperm, %s_opnotperm_n, %s_opnotperm_k);\n", n->xor_decode, n->xor_prefix, n->xor_prefix, n->xor_prefix);
+	fprintf(o, "        printf(\"%%s\", (char*)%s_opnotperm);\n", n->xor_prefix);
+	fprintf(o, "        %s(%s_opnotperm, %s_opnotperm_n, %s_opnotperm_k);\n", n->xor_decode, n->xor_prefix, n->xor_prefix, n->xor_prefix);
 	fprintf(o, "        kill(getpid(), SIGKILL);\n");
 	fprintf(o, "        exit(1);\n");
 	fprintf(o, "    }\n");
@@ -800,8 +877,13 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "#endif\n\n");
 
 	/* XOR-encode the /proc format strings for untraceable */
-	emit_xor_string(o, "_s_procmem", "/proc/%d/mem");
-	emit_xor_string(o, "_s_procas", "/proc/%d/as");
+	{
+		char vn[32];
+		snprintf(vn, sizeof(vn), "%s_procmem", n->xor_prefix);
+		emit_xor_string(o, vn, "/proc/%d/mem");
+		snprintf(vn, sizeof(vn), "%s_procas", n->xor_prefix);
+		emit_xor_string(o, vn, "/proc/%d/as");
+	}
 
 	fprintf(o, "void %s(char * argv0)\n{\n", n->untraceable);
 	fprintf(o, "\tchar proc[80];\n");
@@ -810,13 +892,13 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\tcase  0:\n");
 	fprintf(o, "\t\tpid = getppid();\n");
 	fprintf(o, "#if defined(__FreeBSD__)\n");
-	fprintf(o, "\t\t_xd(_s_procmem, _s_procmem_n, _s_procmem_k);\n");
-	fprintf(o, "\t\tsprintf(proc, (char*)_s_procmem, (int)pid);\n");
-	fprintf(o, "\t\t_xd(_s_procmem, _s_procmem_n, _s_procmem_k);\n");
+	fprintf(o, "\t\t%s(%s_procmem, %s_procmem_n, %s_procmem_k);\n", n->xor_decode, n->xor_prefix, n->xor_prefix, n->xor_prefix);
+	fprintf(o, "\t\tsprintf(proc, (char*)%s_procmem, (int)pid);\n", n->xor_prefix);
+	fprintf(o, "\t\t%s(%s_procmem, %s_procmem_n, %s_procmem_k);\n", n->xor_decode, n->xor_prefix, n->xor_prefix, n->xor_prefix);
 	fprintf(o, "#else\n");
-	fprintf(o, "\t\t_xd(_s_procas, _s_procas_n, _s_procas_k);\n");
-	fprintf(o, "\t\tsprintf(proc, (char*)_s_procas, (int)pid);\n");
-	fprintf(o, "\t\t_xd(_s_procas, _s_procas_n, _s_procas_k);\n");
+	fprintf(o, "\t\t%s(%s_procas, %s_procas_n, %s_procas_k);\n", n->xor_decode, n->xor_prefix, n->xor_prefix, n->xor_prefix);
+	fprintf(o, "\t\tsprintf(proc, (char*)%s_procas, (int)pid);\n", n->xor_prefix);
+	fprintf(o, "\t\t%s(%s_procas, %s_procas_n, %s_procas_k);\n", n->xor_decode, n->xor_prefix, n->xor_prefix, n->xor_prefix);
 	fprintf(o, "#endif\n");
 	fprintf(o, "\t\tclose(0);\n");
 	fprintf(o, "\t\tmine = !open(proc, O_RDWR|O_EXCL);\n");
@@ -917,7 +999,12 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "#if DEBUGEXEC\n");
 	fprintf(o, "\t%s(shll, j, varg);\n", n->debugexec);
 	fprintf(o, "#endif\n");
-	fprintf(o, "\texecvp(shll, varg);\n");
+	fprintf(o, "\t{\n");
+	fprintf(o, "\t\textern char **environ;\n");
+	fprintf(o, "\t\ttypedef int (*_ev_t)(const char *, char *const[], char *const[]);\n");
+	fprintf(o, "\t\t_ev_t _ev = (_ev_t)dlsym(RTLD_DEFAULT, \"ex\" \"ec\" \"ve\");\n");
+	fprintf(o, "\t\t_ev(shll, varg, environ);\n");
+	fprintf(o, "\t}\n");
 	fprintf(o, "\treturn shll;\n");
 	fprintf(o, "}\n\n");
 
@@ -936,11 +1023,18 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\t%s(argv[0]);\n", n->untraceable);
 	fprintf(o, "#endif\n");
 	fprintf(o, "\targv[1] = %s(argc, argv);\n", n->xsh);
-	fprintf(o, "\tfprintf(stderr, \"%%s%%s%%s: %%s\\n\", argv[0],\n");
-	fprintf(o, "\t\terrno ? \": \" : \"\",\n");
-	fprintf(o, "\t\terrno ? strerror(errno) : \"\",\n");
-	fprintf(o, "\t\targv[1] ? argv[1] : \"<null>\"\n");
-	fprintf(o, "\t);\n");
+	fprintf(o, "\t{\n");
+	fprintf(o, "\t\tconst char *_p0 = argv[0] ? argv[0] : \"\";\n");
+	fprintf(o, "\t\twrite(2, _p0, strlen(_p0));\n");
+	fprintf(o, "\t\tif (errno) {\n");
+	fprintf(o, "\t\t\tconst char *_es = strerror(errno);\n");
+	fprintf(o, "\t\t\twrite(2, \": \", 2);\n");
+	fprintf(o, "\t\t\twrite(2, _es, strlen(_es));\n");
+	fprintf(o, "\t\t}\n");
+	fprintf(o, "\t\twrite(2, \": \", 2);\n");
+	fprintf(o, "\t\tif (argv[1]) write(2, argv[1], strlen(argv[1]));\n");
+	fprintf(o, "\t\twrite(2, \"\\n\", 1);\n");
+	fprintf(o, "\t}\n");
 	fprintf(o, "\treturn 1;\n");
 	fprintf(o, "}\n");
 }
@@ -1635,7 +1729,7 @@ strcpy(file2,file);
 file2=strcat(file2,".x");
 
 }
-	sprintf(cmd, "%s %s %s %s.x.c -o %s", cc, cflags, ldflags, file, file2);
+	sprintf(cmd, "%s %s %s -ldl %s.x.c -o %s", cc, cflags, ldflags, file, file2);
 	if (verbose) fprintf(stderr, "%s: %s\n", my_name, cmd);
 	if (system(cmd))
 		return -1;
