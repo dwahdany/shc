@@ -2,7 +2,8 @@
 
 /**
  * Shell Script Compiler
- * Uses ChaCha20 stream cipher for encryption.
+ * Uses a ChaCha20-derived stream cipher with per-compilation randomized
+ * constants and rotation amounts for encryption.
  * Licensed under GPL.
  * http://github.com/neurobin/shc
  */
@@ -174,6 +175,10 @@ struct rt_names {
 	char cc_counter_var[24];
 	char cc_buf_var[24];
 	char cc_buf_pos_var[24];
+	unsigned int cc_consts[4];
+	int cc_rotations[4];
+	char rotl_macro[24];
+	char qr_macro[24];
 };
 
 static const char * rt_prefixes[] = {
@@ -235,6 +240,40 @@ static void init_rt_names(struct rt_names * n)
 	}
 	/* tmp prefix: random dotfile name */
 	snprintf(n->tmp_prefix, sizeof(n->tmp_prefix), ".%08x", (unsigned)rand());
+	/* random cipher constants (nonzero) replacing "expand 32-byte k" */
+	{
+		int i;
+		for (i = 0; i < 4; i++) {
+			unsigned int v;
+			do {
+				v = ((unsigned int)rand() << 16) ^ (unsigned int)rand();
+			} while (v == 0);
+			n->cc_consts[i] = v;
+		}
+	}
+	/* random rotation amounts: distinct, each 5-27, no pair sums to 32 */
+	{
+		int pool[] = {5,6,7,8,9,10,11,13,14,15,17,18,19,21,22,23,24,25,26,27};
+		int pool_n = 20;
+		int chosen[4], nc = 0, i, j, ok;
+		while (nc < 4) {
+			int idx = rand_mod(pool_n);
+			int v = pool[idx];
+			ok = 1;
+			for (j = 0; j < nc; j++) {
+				if (chosen[j] == v || chosen[j] + v == 32) {
+					ok = 0;
+					break;
+				}
+			}
+			if (ok) chosen[nc++] = v;
+		}
+		for (i = 0; i < 4; i++)
+			n->cc_rotations[i] = chosen[i];
+	}
+	/* random macro names for ROTL and QR */
+	gen_rt_name(n->rotl_macro, sizeof(n->rotl_macro));
+	gen_rt_name(n->qr_macro, sizeof(n->qr_macro));
 }
 
 /* XOR-encode a string literal and emit as static array */
@@ -351,53 +390,86 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "static unsigned char %s[64];\n", n->cc_buf_var);
 	fprintf(o, "static int           %s;\n\n", n->cc_buf_pos_var);
 
-	fprintf(o, "#define _ROTL(x,n) (((x)<<(n))|((x)>>(32-(n))))\n");
-	fprintf(o, "#define _QR(a,b,c,d) \\\n");
-	fprintf(o, "\ta+=b; d^=a; d=_ROTL(d,16); \\\n");
-	fprintf(o, "\tc+=d; b^=c; b=_ROTL(b,12); \\\n");
-	fprintf(o, "\ta+=b; d^=a; d=_ROTL(d, 8); \\\n");
-	fprintf(o, "\tc+=d; b^=c; b=_ROTL(b, 7);\n\n");
+	/* cc_block — inlined, interleaved ARX operations (no QR macro) */
+	{
+		char bp1[24], bp2[24], blv[24];
+		gen_rt_name(bp1, sizeof(bp1));
+		gen_rt_name(bp2, sizeof(bp2));
+		gen_rt_name(blv, sizeof(blv));
+		/* QR index sets: 4 columns then 4 diagonals */
+		static const int qr_idx[8][4] = {
+			{0,4,8,12}, {1,5,9,13}, {2,6,10,14}, {3,7,11,15},
+			{0,5,10,15}, {1,6,11,12}, {2,7,8,13}, {3,4,9,14}
+		};
+		int half, step, k;
+		fprintf(o, "static void %s(unsigned int %s[16], const unsigned int %s[16])\n{\n",
+			n->cc_block, bp1, bp2);
+		fprintf(o, "\tint %s;\n", blv);
+		fprintf(o, "\tfor (%s=0; %s<16; %s++) %s[%s]=%s[%s];\n",
+			blv, blv, blv, bp1, blv, bp2, blv);
+		fprintf(o, "\tfor (%s=0; %s<10; %s++) {\n", blv, blv, blv);
+		for (half = 0; half < 2; half++) {
+			int base = half * 4;
+			for (step = 0; step < 4; step++) {
+				int perm[4] = {0, 1, 2, 3};
+				int pi;
+				for (pi = 3; pi > 0; pi--) {
+					int pj = rand_mod(pi + 1);
+					int tmp = perm[pi]; perm[pi] = perm[pj]; perm[pj] = tmp;
+				}
+				for (k = 0; k < 4; k++) {
+					int qi = base + perm[k];
+					int a = qr_idx[qi][0], b = qr_idx[qi][1];
+					int c = qr_idx[qi][2], d = qr_idx[qi][3];
+					int rot = n->cc_rotations[step];
+					if (step == 0 || step == 2) {
+						fprintf(o, "\t\t%s[%d]+=%s[%d]; %s[%d]^=%s[%d]; %s[%d]=(%s[%d]<<%d)|(%s[%d]>>%d);\n",
+							bp1,a, bp1,b, bp1,d, bp1,a, bp1,d, bp1,d,rot, bp1,d,32-rot);
+					} else {
+						fprintf(o, "\t\t%s[%d]+=%s[%d]; %s[%d]^=%s[%d]; %s[%d]=(%s[%d]<<%d)|(%s[%d]>>%d);\n",
+							bp1,c, bp1,d, bp1,b, bp1,c, bp1,b, bp1,b,rot, bp1,b,32-rot);
+					}
+				}
+			}
+		}
+		fprintf(o, "\t}\n");
+		fprintf(o, "\tfor (%s=0; %s<16; %s++) %s[%s]+=%s[%s];\n",
+			blv, blv, blv, bp1, blv, bp2, blv);
+		fprintf(o, "}\n\n");
+	}
 
-	fprintf(o, "static void %s(unsigned int out[16], const unsigned int in[16])\n{\n", n->cc_block);
-	fprintf(o, "\tint i;\n");
-	fprintf(o, "\tfor (i = 0; i < 16; i++) out[i] = in[i];\n");
-	fprintf(o, "\tfor (i = 0; i < 10; i++) {\n");
-	fprintf(o, "\t\t_QR(out[0],out[4],out[ 8],out[12]);\n");
-	fprintf(o, "\t\t_QR(out[1],out[5],out[ 9],out[13]);\n");
-	fprintf(o, "\t\t_QR(out[2],out[6],out[10],out[14]);\n");
-	fprintf(o, "\t\t_QR(out[3],out[7],out[11],out[15]);\n");
-	fprintf(o, "\t\t_QR(out[0],out[5],out[10],out[15]);\n");
-	fprintf(o, "\t\t_QR(out[1],out[6],out[11],out[12]);\n");
-	fprintf(o, "\t\t_QR(out[2],out[7],out[ 8],out[13]);\n");
-	fprintf(o, "\t\t_QR(out[3],out[4],out[ 9],out[14]);\n");
-	fprintf(o, "\t}\n");
-	fprintf(o, "\tfor (i = 0; i < 16; i++) out[i] += in[i];\n");
-	fprintf(o, "}\n\n");
-
-	fprintf(o, "static void %s(unsigned char out[64])\n{\n", n->cc_keystream);
-	fprintf(o, "\tunsigned int state[16], blk[16];\n");
-	fprintf(o, "\tstate[0]=0x61707865; state[1]=0x3320646e;\n");
-	fprintf(o, "\tstate[2]=0x79622d32; state[3]=0x6b206574;\n");
-	fprintf(o, "\tint i;\n");
-	fprintf(o, "\tfor (i = 0; i < 8; i++)\n");
-	fprintf(o, "\t\tstate[4+i] = (unsigned int)%s[i*4]\n", n->cc_key_var);
-	fprintf(o, "\t\t\t| ((unsigned int)%s[i*4+1]<<8)\n", n->cc_key_var);
-	fprintf(o, "\t\t\t| ((unsigned int)%s[i*4+2]<<16)\n", n->cc_key_var);
-	fprintf(o, "\t\t\t| ((unsigned int)%s[i*4+3]<<24);\n", n->cc_key_var);
-	fprintf(o, "\tstate[12] = %s++;\n", n->cc_counter_var);
-	fprintf(o, "\tfor (i = 0; i < 3; i++)\n");
-	fprintf(o, "\t\tstate[13+i] = (unsigned int)%s[i*4]\n", n->cc_nonce_var);
-	fprintf(o, "\t\t\t| ((unsigned int)%s[i*4+1]<<8)\n", n->cc_nonce_var);
-	fprintf(o, "\t\t\t| ((unsigned int)%s[i*4+2]<<16)\n", n->cc_nonce_var);
-	fprintf(o, "\t\t\t| ((unsigned int)%s[i*4+3]<<24);\n", n->cc_nonce_var);
-	fprintf(o, "\t%s(blk, state);\n", n->cc_block);
-	fprintf(o, "\tfor (i = 0; i < 16; i++) {\n");
-	fprintf(o, "\t\tout[i*4+0] = (unsigned char)(blk[i]);\n");
-	fprintf(o, "\t\tout[i*4+1] = (unsigned char)(blk[i]>>8);\n");
-	fprintf(o, "\t\tout[i*4+2] = (unsigned char)(blk[i]>>16);\n");
-	fprintf(o, "\t\tout[i*4+3] = (unsigned char)(blk[i]>>24);\n");
-	fprintf(o, "\t}\n");
-	fprintf(o, "}\n\n");
+	/* cc_keystream — randomized local variable names */
+	{
+		char ksout[24], ksst[24], ksblk[24], kslv[24];
+		gen_rt_name(ksout, sizeof(ksout));
+		gen_rt_name(ksst, sizeof(ksst));
+		gen_rt_name(ksblk, sizeof(ksblk));
+		gen_rt_name(kslv, sizeof(kslv));
+		fprintf(o, "static void %s(unsigned char %s[64])\n{\n", n->cc_keystream, ksout);
+		fprintf(o, "\tunsigned int %s[16], %s[16];\n", ksst, ksblk);
+		fprintf(o, "\t%s[0]=0x%08x; %s[1]=0x%08x;\n", ksst, n->cc_consts[0], ksst, n->cc_consts[1]);
+		fprintf(o, "\t%s[2]=0x%08x; %s[3]=0x%08x;\n", ksst, n->cc_consts[2], ksst, n->cc_consts[3]);
+		fprintf(o, "\tint %s;\n", kslv);
+		fprintf(o, "\tfor (%s = 0; %s < 8; %s++)\n", kslv, kslv, kslv);
+		fprintf(o, "\t\t%s[4+%s] = (unsigned int)%s[%s*4]\n", ksst, kslv, n->cc_key_var, kslv);
+		fprintf(o, "\t\t\t| ((unsigned int)%s[%s*4+1]<<8)\n", n->cc_key_var, kslv);
+		fprintf(o, "\t\t\t| ((unsigned int)%s[%s*4+2]<<16)\n", n->cc_key_var, kslv);
+		fprintf(o, "\t\t\t| ((unsigned int)%s[%s*4+3]<<24);\n", n->cc_key_var, kslv);
+		fprintf(o, "\t%s[12] = %s++;\n", ksst, n->cc_counter_var);
+		fprintf(o, "\tfor (%s = 0; %s < 3; %s++)\n", kslv, kslv, kslv);
+		fprintf(o, "\t\t%s[13+%s] = (unsigned int)%s[%s*4]\n", ksst, kslv, n->cc_nonce_var, kslv);
+		fprintf(o, "\t\t\t| ((unsigned int)%s[%s*4+1]<<8)\n", n->cc_nonce_var, kslv);
+		fprintf(o, "\t\t\t| ((unsigned int)%s[%s*4+2]<<16)\n", n->cc_nonce_var, kslv);
+		fprintf(o, "\t\t\t| ((unsigned int)%s[%s*4+3]<<24);\n", n->cc_nonce_var, kslv);
+		fprintf(o, "\t%s(%s, %s);\n", n->cc_block, ksblk, ksst);
+		fprintf(o, "\tfor (%s = 0; %s < 16; %s++) {\n", kslv, kslv, kslv);
+		fprintf(o, "\t\t%s[%s*4+0] = (unsigned char)(%s[%s]);\n", ksout, kslv, ksblk, kslv);
+		fprintf(o, "\t\t%s[%s*4+1] = (unsigned char)(%s[%s]>>8);\n", ksout, kslv, ksblk, kslv);
+		fprintf(o, "\t\t%s[%s*4+2] = (unsigned char)(%s[%s]>>16);\n", ksout, kslv, ksblk, kslv);
+		fprintf(o, "\t\t%s[%s*4+3] = (unsigned char)(%s[%s]>>24);\n", ksout, kslv, ksblk, kslv);
+		fprintf(o, "\t}\n");
+		fprintf(o, "}\n\n");
+	}
 
 	/* cc_init */
 	fprintf(o, "void %s(void)\n{\n", n->cc_init);
@@ -1019,7 +1091,7 @@ static void parse_args(int argc, char * argv[])
 	}
 }
 
-/* ChaCha20 stream cipher */
+/* ChaCha20-derived stream cipher with per-compilation parameters */
 
 static unsigned char cc_key[32];
 static unsigned char cc_nonce[12];
@@ -1027,26 +1099,33 @@ static unsigned int  cc_counter;
 static unsigned char cc_buf[64];
 static int           cc_buf_pos;
 
+/* Per-compilation cipher parameters — set from rt_names before encryption */
+static unsigned int cc_consts[4] = {0x61707865, 0x3320646e, 0x79622d32, 0x6b206574};
+static int cc_rots[4] = {16, 12, 8, 7};
+
 #define CC_ROTL(x,n) (((x)<<(n))|((x)>>(32-(n))))
-#define CC_QR(a,b,c,d) \
-	a+=b; d^=a; d=CC_ROTL(d,16); \
-	c+=d; b^=c; b=CC_ROTL(b,12); \
-	a+=b; d^=a; d=CC_ROTL(d, 8); \
-	c+=d; b^=c; b=CC_ROTL(b, 7);
+
+static void cc_qr(unsigned int *a, unsigned int *b, unsigned int *c, unsigned int *d)
+{
+	*a+=*b; *d^=*a; *d=CC_ROTL(*d,cc_rots[0]);
+	*c+=*d; *b^=*c; *b=CC_ROTL(*b,cc_rots[1]);
+	*a+=*b; *d^=*a; *d=CC_ROTL(*d,cc_rots[2]);
+	*c+=*d; *b^=*c; *b=CC_ROTL(*b,cc_rots[3]);
+}
 
 static void cc_block(unsigned int out[16], const unsigned int in[16])
 {
 	int i;
 	for (i = 0; i < 16; i++) out[i] = in[i];
 	for (i = 0; i < 10; i++) {
-		CC_QR(out[0],out[4],out[ 8],out[12]);
-		CC_QR(out[1],out[5],out[ 9],out[13]);
-		CC_QR(out[2],out[6],out[10],out[14]);
-		CC_QR(out[3],out[7],out[11],out[15]);
-		CC_QR(out[0],out[5],out[10],out[15]);
-		CC_QR(out[1],out[6],out[11],out[12]);
-		CC_QR(out[2],out[7],out[ 8],out[13]);
-		CC_QR(out[3],out[4],out[ 9],out[14]);
+		cc_qr(&out[0],&out[4],&out[ 8],&out[12]);
+		cc_qr(&out[1],&out[5],&out[ 9],&out[13]);
+		cc_qr(&out[2],&out[6],&out[10],&out[14]);
+		cc_qr(&out[3],&out[7],&out[11],&out[15]);
+		cc_qr(&out[0],&out[5],&out[10],&out[15]);
+		cc_qr(&out[1],&out[6],&out[11],&out[12]);
+		cc_qr(&out[2],&out[7],&out[ 8],&out[13]);
+		cc_qr(&out[3],&out[4],&out[ 9],&out[14]);
 	}
 	for (i = 0; i < 16; i++) out[i] += in[i];
 }
@@ -1054,9 +1133,8 @@ static void cc_block(unsigned int out[16], const unsigned int in[16])
 static void cc_keystream(unsigned char out[64])
 {
 	unsigned int state[16], blk[16];
-	/* "expand 32-byte k" */
-	state[0]=0x61707865; state[1]=0x3320646e;
-	state[2]=0x79622d32; state[3]=0x6b206574;
+	state[0]=cc_consts[0]; state[1]=cc_consts[1];
+	state[2]=cc_consts[2]; state[3]=cc_consts[3];
 	/* key (little-endian) */
 	int i;
 	for (i = 0; i < 8; i++)
@@ -1451,6 +1529,16 @@ int write_C(char * file, char * argv[])
 			noise(pswd, pswd_z, 0, 0);
 		}
 	}
+
+	/* Generate random runtime names and cipher parameters */
+	struct rt_names rtn;
+	init_rt_names(&rtn);
+	data_var_name = rtn.data_var;
+
+	/* Set compiler-side cipher to use the same random parameters */
+	memcpy(cc_consts, rtn.cc_consts, sizeof(cc_consts));
+	memcpy(cc_rots, rtn.cc_rotations, sizeof(cc_rots));
+
 	numd++;
 	cc_init();
 	cc_key_mix(pswd, pswd_z);
@@ -1478,11 +1566,6 @@ int write_C(char * file, char * argv[])
 	/* MAC-based integrity for tst2 */
 	cc_mac(tst2, tst2_z, (unsigned char *)chk2); numd++;
 	cc_crypt(tst2, tst2_z); numd++;
-
-	/* Output */
-	struct rt_names rtn;
-	init_rt_names(&rtn);
-	data_var_name = rtn.data_var;
 
 	name = strcat(realloc(name, strlen(name)+5), ".x.c");
 	o = fopen(name, "w");
