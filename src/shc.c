@@ -1,23 +1,14 @@
 /* shc.c */
 
 /**
- * This software contains an ad hoc version of the 'Alleged RC4' algorithm,
- * which was anonymously posted on sci.crypt news by cypherpunks on Sep 1994.
- *
- * My implementation is a complete rewrite of the one found in
- * an unknown-copyright (283 characters) version picked up from:
- *    From: allen@gateway.grumman.com (John L. Allen)
- *    Newsgroups: comp.lang.c
- *    Subject: Shrink this C code for fame and fun
- *    Date: 21 May 1996 10:49:37 -0400
- * And it is licensed also under GPL.
- *
- *That's where I got it, now I am going to do some work on it
- *It will reside here: http://github.com/neurobin/shc
+ * Shell Script Compiler
+ * Uses ChaCha20 stream cipher for encryption.
+ * Licensed under GPL.
+ * http://github.com/neurobin/shc
  */
 
 static const char my_name[] = "shc";
-static const char version[] = "Version 4.0.3";
+static const char version[] = "Version 5.0.0";
 static const char subject[] = "Generic Shell Script Compiler";
 static const char cpright[] = "GNU GPL Version 3";
 static const struct { const char * f, * s, * e; }
@@ -117,6 +108,10 @@ static const char * help[] = {
 #include <time.h>
 #include <unistd.h>
 
+/* Forward declarations */
+unsigned rand_mod(unsigned mod);
+char rand_chr(void);
+
 #define SIZE 4096
 
 static char * file;
@@ -150,611 +145,733 @@ static const char BUSYBOXON_line[] =
 "#define BUSYBOXON	%d	/* Define as 1 to enable work with busybox */\n";
 static int BUSYBOXON_flag = 0;
 
-static const char * RTC[] = {
-"",
-"#if HARDENING",
-"static const char * shc_x[] = {",
-"\"/*\",",
-"\" * Copyright 2019 - Intika <intika@librefox.org>\",",
-"\" * Replace ******** with secret read from fd 21\",",
-"\" * Also change arguments location of sub commands (sh script commands)\",",
-"\" * gcc -Wall -fpic -shared -o shc_secret.so shc_secret.c -ldl\",",
-"\" */\",",
-"\"\",",
-"\"#define _GNU_SOURCE /* needed to get RTLD_NEXT defined in dlfcn.h */\",",
-"\"#define PLACEHOLDER \\\"********\\\"\",",
-"\"#include <dlfcn.h>\",",
-"\"#include <stdlib.h>\",",
-"\"#include <string.h>\",",
-"\"#include <unistd.h>\",",
-"\"#include <stdio.h>\",",
-"\"#include <signal.h>\",",
-"\"\",",
-"\"static char secret[128000]; //max size\",",
-"\"typedef int (*pfi)(int, char **, char **);\",",
-"\"static pfi real_main;\",",
-"\"\",",
-"\"// copy argv to new location\",",
-"\"char **copyargs(int argc, char** argv){\",",
-"\"    char **newargv = malloc((argc+1)*sizeof(*argv));\",",
-"\"    char *from,*to;\",",
-"\"    int i,len;\",",
-"\"\",",
-"\"    for(i = 0; i<argc; i++){\",",
-"\"        from = argv[i];\",",
-"\"        len = strlen(from)+1;\",",
-"\"        to = malloc(len);\",",
-"\"        memcpy(to,from,len);\",",
-"\"        // zap old argv space\",",
-"\"        memset(from,'\\\\0',len);\",",
-"\"        newargv[i] = to;\",",
-"\"        argv[i] = 0;\",",
-"\"    }\",",
-"\"    newargv[argc] = 0;\",",
-"\"    return newargv;\",",
-"\"}\",",
-"\"\",",
-"\"static int mymain(int argc, char** argv, char** env) {\",",
-"\"    //fprintf(stderr, \\\"Inject main argc = %d\\\\n\\\", argc);\",",
-"\"    return real_main(argc, copyargs(argc,argv), env);\",",
-"\"}\",",
-"\"\",",
-"\"int __libc_start_main(int (*main) (int, char**, char**),\",",
-"\"                      int argc,\",",
-"\"                      char **argv,\",",
-"\"                      void (*init) (void),\",",
-"\"                      void (*fini)(void),\",",
-"\"                      void (*rtld_fini)(void),\",",
-"\"                      void (*stack_end)){\",",
-"\"    static int (*real___libc_start_main)() = NULL;\",",
-"\"    int n;\",",
-"\"\",",
-"\"    if (!real___libc_start_main) {\",",
-"\"        real___libc_start_main = dlsym(RTLD_NEXT, \\\"__libc_start_main\\\");\",",
-"\"        if (!real___libc_start_main) abort();\",",
-"\"    }\",",
-"\"\",",
-"\"    n = read(21, secret, sizeof(secret));\",",
-"\"    if (n > 0) {\",",
-"\"      int i;\",",
-"\"\",",
-"\"    if (secret[n - 1] == '\\\\n') secret[--n] = '\\\\0';\",",
-"\"    for (i = 1; i < argc; i++)\",",
-"\"        if (strcmp(argv[i], PLACEHOLDER) == 0)\",",
-"\"          argv[i] = secret;\",",
-"\"    }\",",
-"\"\",",
-"\"    real_main = main;\",",
-"\"\",",
-"\"    return real___libc_start_main(mymain, argc, argv, init, fini, rtld_fini, stack_end);\",",
-"\"}\",",
-"\"\",",
-"0};",
-"#endif /* HARDENING */",
-"",
-"/* rtc.c */",
-"",
-"#include <sys/stat.h>",
-"#include <sys/types.h>",
-"",
-"#include <errno.h>",
-"#include <stdio.h>",
-"#include <stdlib.h>",
-"#include <string.h>",
-"#include <time.h>",
-"#include <unistd.h>",
-"",
-"/* 'Alleged RC4' */",
-"",
-"static unsigned char stte[256], indx, jndx, kndx;",
-"",
-"/*",
-" * Reset arc4 stte. ",
-" */",
-"void stte_0(void)",
-"{",
-"	indx = jndx = kndx = 0;",
-"	do {",
-"		stte[indx] = indx;",
-"	} while (++indx);",
-"}",
-"",
-"/*",
-" * Set key. Can be used more than once. ",
-" */",
-"void key(void * str, int len)",
-"{",
-"	unsigned char tmp, * ptr = (unsigned char *)str;",
-"	while (len > 0) {",
-"		do {",
-"			tmp = stte[indx];",
-"			kndx += tmp;",
-"			kndx += ptr[(int)indx % len];",
-"			stte[indx] = stte[kndx];",
-"			stte[kndx] = tmp;",
-"		} while (++indx);",
-"		ptr += 256;",
-"		len -= 256;",
-"	}",
-"}",
-"",
-"/*",
-" * Crypt data. ",
-" */",
-"void arc4(void * str, int len)",
-"{",
-"	unsigned char tmp, * ptr = (unsigned char *)str;",
-"	while (len > 0) {",
-"		indx++;",
-"		tmp = stte[indx];",
-"		jndx += tmp;",
-"		stte[indx] = stte[jndx];",
-"		stte[jndx] = tmp;",
-"		tmp += stte[indx];",
-"		*ptr ^= stte[tmp];",
-"		ptr++;",
-"		len--;",
-"	}",
-"}",
-"",
-"/* End of ARC4 */",
-"",
-"#if HARDENING",
-"",
-"#include <sys/ptrace.h>",
-"#include <sys/wait.h>",
-"#include <signal.h>",
-"#include <sys/prctl.h>",
-"#define PR_SET_PTRACER 0x59616d61",
-"",
-"/* Seccomp Sandboxing Init */",
-"#include <stdlib.h>",
-"#include <stdio.h>",
-"#include <stddef.h>",
-"#include <string.h>",
-"#include <unistd.h>",
-"#include <errno.h>",
-"",
-"#include <sys/types.h>",
-"#include <sys/prctl.h>",
-"#include <sys/syscall.h>",
-"#include <sys/socket.h>",
-"",
-"#include <linux/filter.h>",
-"#include <linux/seccomp.h>",
-"#include <linux/audit.h>",
-"",
-"#define ArchField offsetof(struct seccomp_data, arch)",
-"",
-"#define Allow(syscall) \\",
-"    BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, SYS_##syscall, 0, 1), \\",
-"    BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_ALLOW)",
-"",
-"struct sock_filter filter[] = {",
-"    /* validate arch */",
-"    BPF_STMT(BPF_LD+BPF_W+BPF_ABS, ArchField),",
-"    BPF_JUMP( BPF_JMP+BPF_JEQ+BPF_K, AUDIT_ARCH_X86_64, 1, 0),",
-"    BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_KILL),",
-"",
-"    /* load syscall */",
-"    BPF_STMT(BPF_LD+BPF_W+BPF_ABS, offsetof(struct seccomp_data, nr)),",
-"",
-"    /* list of allowed syscalls */",
-"    Allow(exit_group),  /* exits a process */",
-"    Allow(brk),         /* for malloc(), inside libc */",
-"#if MMAP2",
-"    Allow(mmap2),       /* also for malloc() */",
-"#else",
-"    Allow(mmap),        /* also for malloc() */",
-"#endif",
-"    Allow(munmap),      /* for free(), inside libc */",
-"",
-"    /* and if we don't match above, die */",
-"    BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_KILL),",
-"};",
-"struct sock_fprog filterprog = {",
-"    .len = sizeof(filter)/sizeof(filter[0]),",
-"    .filter = filter",
-"};",
-"",
-"/* Seccomp Sandboxing - Set up the restricted environment */",
-"void seccomp_hardening() {",
-"    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) {",
-"        perror(\"Could not start seccomp:\");",
-"        exit(1);",
-"    }",
-"    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &filterprog) == -1) {",
-"        perror(\"Could not start seccomp:\");",
-"        exit(1);",
-"    }",
-"} ",
-"/* End Seccomp Sandboxing Init */",
-"",
-"void shc_x_file() {",
-"    FILE *fp;",
-"    int line = 0;",
-"",
-"    if ((fp = fopen(\"/tmp/shc_x.c\", \"w\")) == NULL ) {exit(1); exit(1);}",
-"    for (line = 0; shc_x[line]; line++)	fprintf(fp, \"%s\\n\", shc_x[line]);",
-"    fflush(fp);fclose(fp);",
-"}",
-"",
-"int make() {",
-"	char * cc, * cflags, * ldflags;",
-"    char cmd[4096];",
-"",
-"	cc = getenv(\"CC\");",
-"	if (!cc) cc = \"cc\";",
-"",
-"	sprintf(cmd, \"%s %s -o %s %s\", cc, \"-Wall -fpic -shared\", \"/tmp/shc_x.so\", \"/tmp/shc_x.c -ldl\");",
-"	if (system(cmd)) {remove(\"/tmp/shc_x.c\"); return -1;}",
-"	remove(\"/tmp/shc_x.c\"); return 0;",
-"}",
-"",
-"void arc4_hardrun(void * str, int len) {",
-"    //Decode locally",
-"    char tmp2[len];",
-"    char tmp3[len+1024];",
-"    memcpy(tmp2, str, len);",
-"",
-"	unsigned char tmp, * ptr = (unsigned char *)tmp2;",
-"    int lentmp = len;",
-"    int pid, status;",
-"    pid = fork();",
-"",
-"    shc_x_file();",
-"    if (make()) {exit(1);}",
-"",
-"    setenv(\"LD_PRELOAD\",\"/tmp/shc_x.so\",1);",
-"",
-"    if(pid==0) {",
-"",
-"        //Start tracing to protect from dump & trace",
-"        if (ptrace(PTRACE_TRACEME, 0, 0, 0) < 0) {",
-"            kill(getpid(), SIGKILL);",
-"            _exit(1);",
-"        }",
-"",
-"        //Decode Bash",
-"        while (len > 0) {",
-"            indx++;",
-"            tmp = stte[indx];",
-"            jndx += tmp;",
-"            stte[indx] = stte[jndx];",
-"            stte[jndx] = tmp;",
-"            tmp += stte[indx];",
-"            *ptr ^= stte[tmp];",
-"            ptr++;",
-"            len--;",
-"        }",
-"",
-"        //Do the magic",
-"        sprintf(tmp3, \"%s %s\", \"'********' 21<<<\", tmp2);",
-"",
-"        //Exec bash script //fork execl with 'sh -c'",
-"        system(tmp2);",
-"",
-"        //Empty script variable",
-"        memcpy(tmp2, str, lentmp);",
-"",
-"        //Clean temp",
-"        remove(\"/tmp/shc_x.so\");",
-"",
-"        //Sinal to detach ptrace",
-"        ptrace(PTRACE_DETACH, 0, 0, 0);",
-"        exit(0);",
-"    }",
-"    else {wait(&status);}",
-"",
-"    /* Seccomp Sandboxing - Start */",
-"    seccomp_hardening();",
-"",
-"    exit(0);",
-"}",
-"#endif /* HARDENING */",
-"",
-"/*",
-" * Key with file invariants. ",
-" */",
-"int key_with_file(char * file)",
-"{",
-"	struct stat statf[1];",
-"	struct stat control[1];",
-"",
-"	if (stat(file, statf) < 0)",
-"		return -1;",
-"",
-"	/* Turn on stable fields */",
-"	memset(control, 0, sizeof(control));",
-"	control->st_ino = statf->st_ino;",
-"	control->st_dev = statf->st_dev;",
-"	control->st_rdev = statf->st_rdev;",
-"	control->st_uid = statf->st_uid;",
-"	control->st_gid = statf->st_gid;",
-"	control->st_size = statf->st_size;",
-"	control->st_mtime = statf->st_mtime;",
-"	control->st_ctime = statf->st_ctime;",
-"	key(control, sizeof(control));",
-"	return 0;",
-"}",
-"",
-"#if DEBUGEXEC",
-"void debugexec(char * sh11, int argc, char ** argv)",
-"{",
-"	int i;",
-"	fprintf(stderr, \"shll=%s\\n\", sh11 ? sh11 : \"<null>\");",
-"	fprintf(stderr, \"argc=%d\\n\", argc);",
-"	if (!argv) {",
-"		fprintf(stderr, \"argv=<null>\\n\");",
-"	} else { ",
-"		for (i = 0; i <= argc ; i++)",
-"			fprintf(stderr, \"argv[%d]=%.60s\\n\", i, argv[i] ? argv[i] : \"<null>\");",
-"	}",
-"}",
-"#endif /* DEBUGEXEC */",
-"",
-"void rmarg(char ** argv, char * arg)",
-"{",
-"	for (; argv && *argv && *argv != arg; argv++);",
-"	for (; argv && *argv; argv++)",
-"		*argv = argv[1];",
-"}",
-"",
-"void chkenv_end(void);",
-"",
-"int chkenv(int argc)",
-"{",
-"	char buff[512];",
-"	unsigned long mask, m;",
-"	int l, a, c;",
-"	char * string;",
-"	extern char ** environ;",
-"",
-"	mask = (unsigned long)getpid();",
-"	stte_0();",
-"	 key(&chkenv, (void*)&chkenv_end - (void*)&chkenv);",
-"	 key(&data, sizeof(data));",
-"	 key(&mask, sizeof(mask));",
-"	arc4(&mask, sizeof(mask));",
-"	sprintf(buff, \"x%lx\", mask);",
-"	string = getenv(buff);",
-"#if DEBUGEXEC",
-"	fprintf(stderr, \"getenv(%s)=%s\\n\", buff, string ? string : \"<null>\");",
-"#endif",
-"	l = strlen(buff);",
-"	if (!string) {",
-"		/* 1st */",
-"		sprintf(&buff[l], \"=%lu %d\", mask, argc);",
-"		putenv(strdup(buff));",
-"		return 0;",
-"	}",
-"	c = sscanf(string, \"%lu %d%c\", &m, &a, buff);",
-"	if (c == 2 && m == mask) {",
-"		/* 3rd */",
-"		rmarg(environ, &string[-l - 1]);",
-"		return 1 + (argc - a);",
-"	}",
-"	return -1;",
-"}",
-"",
-"void chkenv_end(void){}",
-"",
-"#if HARDENING",
-"",
-"static void gets_process_name(const pid_t pid, char * name) {",
-"	char procfile[BUFSIZ];",
-"	sprintf(procfile, \"/proc/%d/cmdline\", pid);",
-"	FILE* f = fopen(procfile, \"r\");",
-"	if (f) {",
-"		size_t size;",
-"		size = fread(name, sizeof (char), sizeof (procfile), f);",
-"		if (size > 0) {",
-"			if ('\\n' == name[size - 1])",
-"				name[size - 1] = '\\0';",
-"		}",
-"		fclose(f);",
-"	}",
-"}",
-"",
-"void hardening() {",
-"    prctl(PR_SET_DUMPABLE, 0);",
-"    prctl(PR_SET_PTRACER, -1);",
-"",
-"    int pid = getppid();",
-"    char name[256] = {0};",
-"    gets_process_name(pid, name);",
-"",
-"    if (   (strcmp(name, \"bash\") != 0) ",
-"        && (strcmp(name, \"/bin/bash\") != 0) ",
-"        && (strcmp(name, \"sh\") != 0) ",
-"        && (strcmp(name, \"/bin/sh\") != 0) ",
-"        && (strcmp(name, \"sudo\") != 0) ",
-"        && (strcmp(name, \"/bin/sudo\") != 0) ",
-"        && (strcmp(name, \"/usr/bin/sudo\") != 0)",
-"        && (strcmp(name, \"gksudo\") != 0) ",
-"        && (strcmp(name, \"/bin/gksudo\") != 0) ",
-"        && (strcmp(name, \"/usr/bin/gksudo\") != 0) ",
-"        && (strcmp(name, \"kdesu\") != 0) ",
-"        && (strcmp(name, \"/bin/kdesu\") != 0) ",
-"        && (strcmp(name, \"/usr/bin/kdesu\") != 0) ",
-"       )",
-"    {",
-"        printf(\"Operation not permitted\\n\");",
-"        kill(getpid(), SIGKILL);",
-"        exit(1);",
-"    }",
-"}",
-"",
-"#endif /* HARDENING */",
-"",
-"#if !TRACEABLE",
-"",
-"#define _LINUX_SOURCE_COMPAT",
-"#include <sys/ptrace.h>",
-"#include <sys/types.h>",
-"#include <sys/wait.h>",
-"#include <fcntl.h>",
-"#include <signal.h>",
-"#include <stdio.h>",
-"#include <unistd.h>",
-"",
-"#if !defined(PT_ATTACHEXC) /* New replacement for PT_ATTACH */",
-"   #if !defined(PTRACE_ATTACH) && defined(PT_ATTACH)",
-"       #define PT_ATTACHEXC	PT_ATTACH",
-"   #elif defined(PTRACE_ATTACH)",
-"       #define PT_ATTACHEXC PTRACE_ATTACH",
-"   #endif",
-"#endif",
-"",
-"void untraceable(char * argv0)",
-"{",
-"	char proc[80];",
-"	int pid, mine;",
-"",
-"	switch(pid = fork()) {",
-"	case  0:",
-"		pid = getppid();",
-"		/* For problematic SunOS ptrace */",
-"#if defined(__FreeBSD__)",
-"		sprintf(proc, \"/proc/%d/mem\", (int)pid);",
-"#else",
-"		sprintf(proc, \"/proc/%d/as\",  (int)pid);",
-"#endif",
-"		close(0);",
-"		mine = !open(proc, O_RDWR|O_EXCL);",
-"		if (!mine && errno != EBUSY)",
-"			mine = !ptrace(PT_ATTACHEXC, pid, 0, 0);",
-"		if (mine) {",
-"			kill(pid, SIGCONT);",
-"		} else {",
-/*"			fprintf(stderr, \"%s is being traced!\\n\", argv0);",*/
-"			perror(argv0);",
-"			kill(pid, SIGKILL);",
-"		}",
-"		_exit(mine);",
-"	case -1:",
-"		break;",
-"	default:",
-"		if (pid == waitpid(pid, 0, 0))",
-"			return;",
-"	}",
-"	perror(argv0);",
-"	_exit(1);",
-"}",
-"#endif /* !TRACEABLE */",
-"",
-"char * xsh(int argc, char ** argv)",
-"{",
-"	char * scrpt;",
-"	int ret, i, j;",
-"	char ** varg;",
-"	char * me = argv[0];",
-"	if (me == NULL) { me = getenv(\"_\"); }",
-"	if (me == 0) { fprintf(stderr, \"E: neither argv[0] nor $_ works.\"); exit(1); }",
-"",
-"	ret = chkenv(argc);",
-"	stte_0();",
-"	 key(pswd, pswd_z);",
-"	arc4(msg1, msg1_z);",
-"	arc4(date, date_z);",
-"	if (date[0] && (atoll(date)<time(NULL)))",
-"		return msg1;",
-"	arc4(shll, shll_z);",
-"	arc4(inlo, inlo_z);",
-"	arc4(xecc, xecc_z);",
-"	arc4(lsto, lsto_z);",
-"	arc4(tst1, tst1_z);",
-"	 key(tst1, tst1_z);",
-"	arc4(chk1, chk1_z);",
-"	if ((chk1_z != tst1_z) || memcmp(tst1, chk1, tst1_z))",
-"		return tst1;",
-"	arc4(msg2, msg2_z);",
-"	if (ret < 0)",
-"		return msg2;",
-"	varg = (char **)calloc(argc + 10, sizeof(char *));",
-"	if (!varg)",
-"		return 0;",
-"	if (ret) {",
-"		arc4(rlax, rlax_z);",
-"		if (!rlax[0] && key_with_file(shll))",
-"			return shll;",
-"		arc4(opts, opts_z);",
-"#if HARDENING",
-"	    arc4_hardrun(text, text_z);",
-"	    exit(0);",
-"       /* Seccomp Sandboxing - Start */",
-"       seccomp_hardening();",
-"#endif",
-"		arc4(text, text_z);",
-"		arc4(tst2, tst2_z);",
-"		 key(tst2, tst2_z);",
-"		arc4(chk2, chk2_z);",
-"		if ((chk2_z != tst2_z) || memcmp(tst2, chk2, tst2_z))",
-"			return tst2;",
-"		/* Prepend hide_z spaces to script text to hide it. */",
-"		scrpt = malloc(hide_z + text_z);",
-"		if (!scrpt)",
-"			return 0;",
-"		memset(scrpt, (int) ' ', hide_z);",
-"		memcpy(&scrpt[hide_z], text, text_z);",
-"	} else {			/* Reexecute */",
-"		if (*xecc) {",
-"			scrpt = malloc(512);",
-"			if (!scrpt)",
-"				return 0;",
-"			sprintf(scrpt, xecc, me);",
-"		} else {",
-"			scrpt = me;",
-"		}",
-"	}",
-"	j = 0;",
-"#if BUSYBOXON",
-"	varg[j++] = \"busybox\";",
-"	varg[j++] = \"sh\";",
-"#else",
-"	varg[j++] = argv[0];		/* My own name at execution */",
-"#endif",
-"	if (ret && *opts)",
-"		varg[j++] = opts;	/* Options on 1st line of code */",
-"	if (*inlo)",
-"		varg[j++] = inlo;	/* Option introducing inline code */",
-"	varg[j++] = scrpt;		/* The script itself */",
-"	if (*lsto)",
-"		varg[j++] = lsto;	/* Option meaning last option */",
-"	i = (ret > 1) ? ret : 0;	/* Args numbering correction */",
-"	while (i < argc)",
-"		varg[j++] = argv[i++];	/* Main run-time arguments */",
-"	varg[j] = 0;			/* NULL terminated array */",
-"#if DEBUGEXEC",
-"	debugexec(shll, j, varg);",
-"#endif",
-"	execvp(shll, varg);",
-"	return shll;",
-"}",
-"",
-"int main(int argc, char ** argv)",
-"{",
-"#if SETUID",
-"   setuid(0);",
-"#endif",
-"#if DEBUGEXEC",
-"	debugexec(\"main\", argc, argv);",
-"#endif",
-"#if HARDENING",
-"	hardening();",
-"#endif",
-"#if !TRACEABLE",
-"	untraceable(argv[0]);",
-"#endif",
-"	argv[1] = xsh(argc, argv);",
-"	fprintf(stderr, \"%s%s%s: %s\\n\", argv[0],",
-"		errno ? \": \" : \"\",",
-"		errno ? strerror(errno) : \"\",",
-"		argv[1] ? argv[1] : \"<null>\"",
-"	);",
-"	return 1;",
-"}",
-0};
+/* Runtime name generation */
+struct rt_names {
+	char cc_init[24];
+	char cc_key_mix[24];
+	char cc_crypt[24];
+	char cc_mac[24];
+	char cc_block[24];
+	char cc_keystream[24];
+	char key_with_file[24];
+	char chkenv[24];
+	char chkenv_end[24];
+	char untraceable[24];
+	char hardening[24];
+	char xsh[24];
+	char debugexec[24];
+	char rmarg[24];
+	char data_var[24];
+	char env_prefix[8];
+	char tmp_prefix[24];
+	char seccomp_hardening[24];
+	char shc_x_file[24];
+	char rt_make[24];
+	char hardrun[24];
+	char gets_pname[24];
+	char cc_key_var[24];
+	char cc_nonce_var[24];
+	char cc_counter_var[24];
+	char cc_buf_var[24];
+	char cc_buf_pos_var[24];
+};
+
+static const char * rt_prefixes[] = {
+	"cfg_", "buf_", "ctx_", "proc_", "sys_", "io_",
+	"mem_", "val_", "net_", "res_", "hdl_", "obj_",
+	NULL
+};
+static const char * rt_suffixes[] = {
+	"data", "init", "run", "load", "sync", "exec",
+	"open", "read", "step", "node", "item", "pool",
+	NULL
+};
+
+static void gen_rt_name(char * out, int maxlen)
+{
+	int np = 0, ns = 0;
+	const char ** p;
+	char hex[8];
+	for (p = rt_prefixes; *p; p++) np++;
+	for (p = rt_suffixes; *p; p++) ns++;
+	sprintf(hex, "%03x", rand_mod(0xfff));
+	snprintf(out, maxlen, "%s%s%s", rt_prefixes[rand_mod(np)], rt_suffixes[rand_mod(ns)], hex);
+}
+
+static void init_rt_names(struct rt_names * n)
+{
+	gen_rt_name(n->cc_init, sizeof(n->cc_init));
+	gen_rt_name(n->cc_key_mix, sizeof(n->cc_key_mix));
+	gen_rt_name(n->cc_crypt, sizeof(n->cc_crypt));
+	gen_rt_name(n->cc_mac, sizeof(n->cc_mac));
+	gen_rt_name(n->cc_block, sizeof(n->cc_block));
+	gen_rt_name(n->cc_keystream, sizeof(n->cc_keystream));
+	gen_rt_name(n->key_with_file, sizeof(n->key_with_file));
+	gen_rt_name(n->chkenv, sizeof(n->chkenv));
+	gen_rt_name(n->chkenv_end, sizeof(n->chkenv_end));
+	gen_rt_name(n->untraceable, sizeof(n->untraceable));
+	gen_rt_name(n->hardening, sizeof(n->hardening));
+	gen_rt_name(n->xsh, sizeof(n->xsh));
+	gen_rt_name(n->debugexec, sizeof(n->debugexec));
+	gen_rt_name(n->rmarg, sizeof(n->rmarg));
+	gen_rt_name(n->data_var, sizeof(n->data_var));
+	gen_rt_name(n->seccomp_hardening, sizeof(n->seccomp_hardening));
+	gen_rt_name(n->shc_x_file, sizeof(n->shc_x_file));
+	gen_rt_name(n->rt_make, sizeof(n->rt_make));
+	gen_rt_name(n->hardrun, sizeof(n->hardrun));
+	gen_rt_name(n->gets_pname, sizeof(n->gets_pname));
+	gen_rt_name(n->cc_key_var, sizeof(n->cc_key_var));
+	gen_rt_name(n->cc_nonce_var, sizeof(n->cc_nonce_var));
+	gen_rt_name(n->cc_counter_var, sizeof(n->cc_counter_var));
+	gen_rt_name(n->cc_buf_var, sizeof(n->cc_buf_var));
+	gen_rt_name(n->cc_buf_pos_var, sizeof(n->cc_buf_pos_var));
+	/* env prefix: 2-4 lowercase chars */
+	{
+		int len = 2 + rand_mod(3);
+		int i;
+		for (i = 0; i < len; i++)
+			n->env_prefix[i] = 'a' + rand_mod(26);
+		n->env_prefix[len] = '\0';
+	}
+	/* tmp prefix: random dotfile name */
+	snprintf(n->tmp_prefix, sizeof(n->tmp_prefix), ".%08x", (unsigned)rand());
+}
+
+/* XOR-encode a string literal and emit as static array */
+static void emit_xor_string(FILE *o, const char *varname, const char *str)
+{
+	unsigned char xk = (unsigned char)(1 + rand_mod(254));
+	int len = strlen(str);
+	int i;
+	fprintf(o, "static unsigned char %s[] = {", varname);
+	for (i = 0; i <= len; i++) {
+		if (i % 12 == 0) fprintf(o, "\n\t");
+		fprintf(o, "0x%02x", (unsigned char)str[i] ^ xk);
+		if (i < len) fprintf(o, ",");
+	}
+	fprintf(o, "};\n");
+	fprintf(o, "#define %s_k 0x%02x\n", varname, xk);
+	fprintf(o, "#define %s_n %d\n", varname, len + 1);
+}
+
+/* Decode macro for XOR strings — decodes in place, use, then re-encode */
+static void emit_xor_decode_func(FILE *o)
+{
+	fprintf(o, "static void _xd(unsigned char *s, int n, unsigned char k) {\n");
+	fprintf(o, "\tint i; for(i=0;i<n;i++) s[i]^=k;\n");
+	fprintf(o, "}\n");
+}
+
+static void emit_runtime(FILE *o, struct rt_names *n)
+{
+	/* HARDENING: shc_x shared library source */
+	fprintf(o, "\n#if HARDENING\n");
+	fprintf(o, "static const char * _hx[] = {\n");
+	fprintf(o, "\"/*\",\n");
+	fprintf(o, "\" * Replace ******** with secret read from fd 21\",\n");
+	fprintf(o, "\" * gcc -Wall -fpic -shared -o _hx.so _hx.c -ldl\",\n");
+	fprintf(o, "\" */\",\n");
+	fprintf(o, "\"\",\n");
+	fprintf(o, "\"#define _GNU_SOURCE\",\n");
+	fprintf(o, "\"#define PLACEHOLDER \\\"********\\\"\",\n");
+	fprintf(o, "\"#include <dlfcn.h>\",\n");
+	fprintf(o, "\"#include <stdlib.h>\",\n");
+	fprintf(o, "\"#include <string.h>\",\n");
+	fprintf(o, "\"#include <unistd.h>\",\n");
+	fprintf(o, "\"#include <stdio.h>\",\n");
+	fprintf(o, "\"#include <signal.h>\",\n");
+	fprintf(o, "\"\",\n");
+	fprintf(o, "\"static char secret[128000];\",\n");
+	fprintf(o, "\"typedef int (*pfi)(int, char **, char **);\",\n");
+	fprintf(o, "\"static pfi real_main;\",\n");
+	fprintf(o, "\"\",\n");
+	fprintf(o, "\"char **copyargs(int argc, char** argv){\",\n");
+	fprintf(o, "\"    char **newargv = malloc((argc+1)*sizeof(*argv));\",\n");
+	fprintf(o, "\"    char *from,*to;\",\n");
+	fprintf(o, "\"    int i,len;\",\n");
+	fprintf(o, "\"    for(i = 0; i<argc; i++){\",\n");
+	fprintf(o, "\"        from = argv[i];\",\n");
+	fprintf(o, "\"        len = strlen(from)+1;\",\n");
+	fprintf(o, "\"        to = malloc(len);\",\n");
+	fprintf(o, "\"        memcpy(to,from,len);\",\n");
+	fprintf(o, "\"        memset(from,'\\\\0',len);\",\n");
+	fprintf(o, "\"        newargv[i] = to;\",\n");
+	fprintf(o, "\"        argv[i] = 0;\",\n");
+	fprintf(o, "\"    }\",\n");
+	fprintf(o, "\"    newargv[argc] = 0;\",\n");
+	fprintf(o, "\"    return newargv;\",\n");
+	fprintf(o, "\"}\",\n");
+	fprintf(o, "\"\",\n");
+	fprintf(o, "\"static int mymain(int argc, char** argv, char** env) {\",\n");
+	fprintf(o, "\"    return real_main(argc, copyargs(argc,argv), env);\",\n");
+	fprintf(o, "\"}\",\n");
+	fprintf(o, "\"\",\n");
+	fprintf(o, "\"int __libc_start_main(int (*main) (int, char**, char**),\",\n");
+	fprintf(o, "\"                      int argc,\",\n");
+	fprintf(o, "\"                      char **argv,\",\n");
+	fprintf(o, "\"                      void (*init) (void),\",\n");
+	fprintf(o, "\"                      void (*fini)(void),\",\n");
+	fprintf(o, "\"                      void (*rtld_fini)(void),\",\n");
+	fprintf(o, "\"                      void (*stack_end)){\",\n");
+	fprintf(o, "\"    static int (*real___libc_start_main)() = NULL;\",\n");
+	fprintf(o, "\"    int n;\",\n");
+	fprintf(o, "\"    if (!real___libc_start_main) {\",\n");
+	fprintf(o, "\"        real___libc_start_main = dlsym(RTLD_NEXT, \\\"__libc_start_main\\\");\",\n");
+	fprintf(o, "\"        if (!real___libc_start_main) abort();\",\n");
+	fprintf(o, "\"    }\",\n");
+	fprintf(o, "\"    n = read(21, secret, sizeof(secret));\",\n");
+	fprintf(o, "\"    if (n > 0) {\",\n");
+	fprintf(o, "\"      int i;\",\n");
+	fprintf(o, "\"    if (secret[n - 1] == '\\\\n') secret[--n] = '\\\\0';\",\n");
+	fprintf(o, "\"    for (i = 1; i < argc; i++)\",\n");
+	fprintf(o, "\"        if (strcmp(argv[i], PLACEHOLDER) == 0)\",\n");
+	fprintf(o, "\"          argv[i] = secret;\",\n");
+	fprintf(o, "\"    }\",\n");
+	fprintf(o, "\"    real_main = main;\",\n");
+	fprintf(o, "\"    return real___libc_start_main(mymain, argc, argv, init, fini, rtld_fini, stack_end);\",\n");
+	fprintf(o, "\"}\",\n");
+	fprintf(o, "\"\",\n");
+	fprintf(o, "0};\n");
+	fprintf(o, "#endif /* HARDENING */\n\n");
+
+	/* Includes */
+	fprintf(o, "#include <sys/stat.h>\n");
+	fprintf(o, "#include <sys/types.h>\n");
+	fprintf(o, "#include <errno.h>\n");
+	fprintf(o, "#include <stdio.h>\n");
+	fprintf(o, "#include <stdlib.h>\n");
+	fprintf(o, "#include <string.h>\n");
+	fprintf(o, "#include <time.h>\n");
+	fprintf(o, "#include <unistd.h>\n\n");
+
+	/* ChaCha20 implementation with randomized names */
+	fprintf(o, "static unsigned char %s[32];\n", n->cc_key_var);
+	fprintf(o, "static unsigned char %s[12];\n", n->cc_nonce_var);
+	fprintf(o, "static unsigned int  %s;\n", n->cc_counter_var);
+	fprintf(o, "static unsigned char %s[64];\n", n->cc_buf_var);
+	fprintf(o, "static int           %s;\n\n", n->cc_buf_pos_var);
+
+	fprintf(o, "#define _ROTL(x,n) (((x)<<(n))|((x)>>(32-(n))))\n");
+	fprintf(o, "#define _QR(a,b,c,d) \\\n");
+	fprintf(o, "\ta+=b; d^=a; d=_ROTL(d,16); \\\n");
+	fprintf(o, "\tc+=d; b^=c; b=_ROTL(b,12); \\\n");
+	fprintf(o, "\ta+=b; d^=a; d=_ROTL(d, 8); \\\n");
+	fprintf(o, "\tc+=d; b^=c; b=_ROTL(b, 7);\n\n");
+
+	fprintf(o, "static void %s(unsigned int out[16], const unsigned int in[16])\n{\n", n->cc_block);
+	fprintf(o, "\tint i;\n");
+	fprintf(o, "\tfor (i = 0; i < 16; i++) out[i] = in[i];\n");
+	fprintf(o, "\tfor (i = 0; i < 10; i++) {\n");
+	fprintf(o, "\t\t_QR(out[0],out[4],out[ 8],out[12]);\n");
+	fprintf(o, "\t\t_QR(out[1],out[5],out[ 9],out[13]);\n");
+	fprintf(o, "\t\t_QR(out[2],out[6],out[10],out[14]);\n");
+	fprintf(o, "\t\t_QR(out[3],out[7],out[11],out[15]);\n");
+	fprintf(o, "\t\t_QR(out[0],out[5],out[10],out[15]);\n");
+	fprintf(o, "\t\t_QR(out[1],out[6],out[11],out[12]);\n");
+	fprintf(o, "\t\t_QR(out[2],out[7],out[ 8],out[13]);\n");
+	fprintf(o, "\t\t_QR(out[3],out[4],out[ 9],out[14]);\n");
+	fprintf(o, "\t}\n");
+	fprintf(o, "\tfor (i = 0; i < 16; i++) out[i] += in[i];\n");
+	fprintf(o, "}\n\n");
+
+	fprintf(o, "static void %s(unsigned char out[64])\n{\n", n->cc_keystream);
+	fprintf(o, "\tunsigned int state[16], blk[16];\n");
+	fprintf(o, "\tstate[0]=0x61707865; state[1]=0x3320646e;\n");
+	fprintf(o, "\tstate[2]=0x79622d32; state[3]=0x6b206574;\n");
+	fprintf(o, "\tint i;\n");
+	fprintf(o, "\tfor (i = 0; i < 8; i++)\n");
+	fprintf(o, "\t\tstate[4+i] = (unsigned int)%s[i*4]\n", n->cc_key_var);
+	fprintf(o, "\t\t\t| ((unsigned int)%s[i*4+1]<<8)\n", n->cc_key_var);
+	fprintf(o, "\t\t\t| ((unsigned int)%s[i*4+2]<<16)\n", n->cc_key_var);
+	fprintf(o, "\t\t\t| ((unsigned int)%s[i*4+3]<<24);\n", n->cc_key_var);
+	fprintf(o, "\tstate[12] = %s++;\n", n->cc_counter_var);
+	fprintf(o, "\tfor (i = 0; i < 3; i++)\n");
+	fprintf(o, "\t\tstate[13+i] = (unsigned int)%s[i*4]\n", n->cc_nonce_var);
+	fprintf(o, "\t\t\t| ((unsigned int)%s[i*4+1]<<8)\n", n->cc_nonce_var);
+	fprintf(o, "\t\t\t| ((unsigned int)%s[i*4+2]<<16)\n", n->cc_nonce_var);
+	fprintf(o, "\t\t\t| ((unsigned int)%s[i*4+3]<<24);\n", n->cc_nonce_var);
+	fprintf(o, "\t%s(blk, state);\n", n->cc_block);
+	fprintf(o, "\tfor (i = 0; i < 16; i++) {\n");
+	fprintf(o, "\t\tout[i*4+0] = (unsigned char)(blk[i]);\n");
+	fprintf(o, "\t\tout[i*4+1] = (unsigned char)(blk[i]>>8);\n");
+	fprintf(o, "\t\tout[i*4+2] = (unsigned char)(blk[i]>>16);\n");
+	fprintf(o, "\t\tout[i*4+3] = (unsigned char)(blk[i]>>24);\n");
+	fprintf(o, "\t}\n");
+	fprintf(o, "}\n\n");
+
+	/* cc_init */
+	fprintf(o, "void %s(void)\n{\n", n->cc_init);
+	fprintf(o, "\tmemset(%s, 0, 32);\n", n->cc_key_var);
+	fprintf(o, "\tmemset(%s, 0, 12);\n", n->cc_nonce_var);
+	fprintf(o, "\t%s = 0;\n", n->cc_counter_var);
+	fprintf(o, "\t%s = 64;\n", n->cc_buf_pos_var);
+	fprintf(o, "}\n\n");
+
+	/* cc_key_mix */
+	fprintf(o, "void %s(void * str, int len)\n{\n", n->cc_key_mix);
+	fprintf(o, "\tunsigned char * ptr = (unsigned char *)str;\n");
+	fprintf(o, "\tint i;\n");
+	fprintf(o, "\tfor (i = 0; i < len; i++) {\n");
+	fprintf(o, "\t\t%s[i %% 32] ^= ptr[i];\n", n->cc_key_var);
+	fprintf(o, "\t\t%s[i %% 12] ^= ptr[i];\n", n->cc_nonce_var);
+	fprintf(o, "\t}\n");
+	fprintf(o, "\tunsigned char tmp[64];\n");
+	fprintf(o, "\t%s = 0;\n", n->cc_counter_var);
+	fprintf(o, "\t%s(tmp);\n", n->cc_keystream);
+	fprintf(o, "\tmemcpy(%s, tmp, 32);\n", n->cc_key_var);
+	fprintf(o, "\tmemcpy(%s, tmp + 32, 12);\n", n->cc_nonce_var);
+	fprintf(o, "\t%s = 0;\n", n->cc_counter_var);
+	fprintf(o, "\t%s = 64;\n", n->cc_buf_pos_var);
+	fprintf(o, "}\n\n");
+
+	/* cc_crypt */
+	fprintf(o, "void %s(void * str, int len)\n{\n", n->cc_crypt);
+	fprintf(o, "\tunsigned char * ptr = (unsigned char *)str;\n");
+	fprintf(o, "\tint i;\n");
+	fprintf(o, "\tfor (i = 0; i < len; i++) {\n");
+	fprintf(o, "\t\tif (%s >= 64) {\n", n->cc_buf_pos_var);
+	fprintf(o, "\t\t\t%s(%s);\n", n->cc_keystream, n->cc_buf_var);
+	fprintf(o, "\t\t\t%s = 0;\n", n->cc_buf_pos_var);
+	fprintf(o, "\t\t}\n");
+	fprintf(o, "\t\tptr[i] ^= %s[%s++];\n", n->cc_buf_var, n->cc_buf_pos_var);
+	fprintf(o, "\t}\n");
+	fprintf(o, "}\n\n");
+
+	/* cc_mac */
+	fprintf(o, "void %s(void * str, int len, unsigned char tag[32])\n{\n", n->cc_mac);
+	fprintf(o, "\tunsigned char mk[32], mn[12], blk[64];\n");
+	fprintf(o, "\tunsigned char sk[32], sn[12];\n");
+	fprintf(o, "\tunsigned int sc; int sp, i;\n");
+	fprintf(o, "\tmemcpy(mk, %s, 32);\n", n->cc_key_var);
+	fprintf(o, "\tmemcpy(mn, %s, 12);\n", n->cc_nonce_var);
+	fprintf(o, "\tmn[0] ^= 0xff;\n");
+	fprintf(o, "\tmemcpy(sk, %s, 32);\n", n->cc_key_var);
+	fprintf(o, "\tmemcpy(sn, %s, 12);\n", n->cc_nonce_var);
+	fprintf(o, "\tsc = %s; sp = %s;\n", n->cc_counter_var, n->cc_buf_pos_var);
+	fprintf(o, "\tmemcpy(%s, mk, 32);\n", n->cc_key_var);
+	fprintf(o, "\tmemcpy(%s, mn, 12);\n", n->cc_nonce_var);
+	fprintf(o, "\t%s = 0;\n", n->cc_counter_var);
+	fprintf(o, "\tunsigned char lenbuf[4];\n");
+	fprintf(o, "\tlenbuf[0]=(unsigned char)(len);\n");
+	fprintf(o, "\tlenbuf[1]=(unsigned char)(len>>8);\n");
+	fprintf(o, "\tlenbuf[2]=(unsigned char)(len>>16);\n");
+	fprintf(o, "\tlenbuf[3]=(unsigned char)(len>>24);\n");
+	fprintf(o, "\tfor(i=0;i<4;i++) %s[i]^=lenbuf[i];\n", n->cc_key_var);
+	fprintf(o, "\tunsigned char *ptr=(unsigned char*)str;\n");
+	fprintf(o, "\tfor(i=0;i<len;i++) {\n");
+	fprintf(o, "\t\t%s[i%%32]^=ptr[i];\n", n->cc_key_var);
+	fprintf(o, "\t\tif((i%%32)==31||i==len-1){\n");
+	fprintf(o, "\t\t\t%s=0;\n", n->cc_counter_var);
+	fprintf(o, "\t\t\t%s(blk);\n", n->cc_keystream);
+	fprintf(o, "\t\t\tmemcpy(%s,blk,32);\n", n->cc_key_var);
+	fprintf(o, "\t\t}\n");
+	fprintf(o, "\t}\n");
+	fprintf(o, "\t%s=0;\n", n->cc_counter_var);
+	fprintf(o, "\t%s(blk);\n", n->cc_keystream);
+	fprintf(o, "\tmemcpy(tag,blk,32);\n");
+	fprintf(o, "\tmemcpy(%s,sk,32);\n", n->cc_key_var);
+	fprintf(o, "\tmemcpy(%s,sn,12);\n", n->cc_nonce_var);
+	fprintf(o, "\t%s=sc; %s=sp;\n", n->cc_counter_var, n->cc_buf_pos_var);
+	fprintf(o, "}\n\n");
+
+	/* HARDENING section */
+	fprintf(o, "#if HARDENING\n\n");
+	fprintf(o, "#include <sys/ptrace.h>\n");
+	fprintf(o, "#include <sys/wait.h>\n");
+	fprintf(o, "#include <signal.h>\n");
+	fprintf(o, "#include <sys/prctl.h>\n");
+	fprintf(o, "#define PR_SET_PTRACER 0x59616d61\n\n");
+
+	fprintf(o, "#include <stddef.h>\n");
+	fprintf(o, "#include <sys/syscall.h>\n");
+	fprintf(o, "#include <sys/socket.h>\n");
+	fprintf(o, "#include <linux/filter.h>\n");
+	fprintf(o, "#include <linux/seccomp.h>\n");
+	fprintf(o, "#include <linux/audit.h>\n\n");
+
+	fprintf(o, "#define ArchField offsetof(struct seccomp_data, arch)\n");
+	fprintf(o, "#define Allow(syscall) \\\n");
+	fprintf(o, "    BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, SYS_##syscall, 0, 1), \\\n");
+	fprintf(o, "    BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_ALLOW)\n\n");
+
+	fprintf(o, "struct sock_filter filter[] = {\n");
+	fprintf(o, "    BPF_STMT(BPF_LD+BPF_W+BPF_ABS, ArchField),\n");
+	fprintf(o, "    BPF_JUMP( BPF_JMP+BPF_JEQ+BPF_K, AUDIT_ARCH_X86_64, 1, 0),\n");
+	fprintf(o, "    BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_KILL),\n");
+	fprintf(o, "    BPF_STMT(BPF_LD+BPF_W+BPF_ABS, offsetof(struct seccomp_data, nr)),\n");
+	fprintf(o, "    Allow(exit_group),\n");
+	fprintf(o, "    Allow(brk),\n");
+	fprintf(o, "#if MMAP2\n");
+	fprintf(o, "    Allow(mmap2),\n");
+	fprintf(o, "#else\n");
+	fprintf(o, "    Allow(mmap),\n");
+	fprintf(o, "#endif\n");
+	fprintf(o, "    Allow(munmap),\n");
+	fprintf(o, "    BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_KILL),\n");
+	fprintf(o, "};\n");
+	fprintf(o, "struct sock_fprog filterprog = {\n");
+	fprintf(o, "    .len = sizeof(filter)/sizeof(filter[0]),\n");
+	fprintf(o, "    .filter = filter\n");
+	fprintf(o, "};\n\n");
+
+	fprintf(o, "void %s() {\n", n->seccomp_hardening);
+	fprintf(o, "    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) { exit(1); }\n");
+	fprintf(o, "    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &filterprog) == -1) { exit(1); }\n");
+	fprintf(o, "}\n\n");
+
+	/* shc_x_file with randomized tmp paths */
+	fprintf(o, "void %s() {\n", n->shc_x_file);
+	fprintf(o, "    FILE *fp;\n");
+	fprintf(o, "    int line = 0;\n");
+	fprintf(o, "    if ((fp = fopen(\"/tmp/%s.c\", \"w\")) == NULL) {exit(1);}\n", n->tmp_prefix);
+	fprintf(o, "    for (line = 0; _hx[line]; line++) fprintf(fp, \"%%s\\n\", _hx[line]);\n");
+	fprintf(o, "    fflush(fp); fclose(fp);\n");
+	fprintf(o, "}\n\n");
+
+	fprintf(o, "int %s() {\n", n->rt_make);
+	fprintf(o, "\tchar * cc;\n");
+	fprintf(o, "    char cmd[4096];\n");
+	fprintf(o, "\tcc = getenv(\"CC\");\n");
+	fprintf(o, "\tif (!cc) cc = \"cc\";\n");
+	fprintf(o, "\tsprintf(cmd, \"%%s %%s -o %%s %%s\", cc, \"-Wall -fpic -shared\", \"/tmp/%s.so\", \"/tmp/%s.c -ldl\");\n", n->tmp_prefix, n->tmp_prefix);
+	fprintf(o, "\tif (system(cmd)) {remove(\"/tmp/%s.c\"); return -1;}\n", n->tmp_prefix);
+	fprintf(o, "\tremove(\"/tmp/%s.c\"); return 0;\n", n->tmp_prefix);
+	fprintf(o, "}\n\n");
+
+	/* hardrun with ChaCha20 */
+	fprintf(o, "void %s(void * str, int len) {\n", n->hardrun);
+	fprintf(o, "    char tmp2[len];\n");
+	fprintf(o, "    memcpy(tmp2, str, len);\n");
+	fprintf(o, "    int pid, status;\n");
+	fprintf(o, "    pid = fork();\n");
+	fprintf(o, "    %s();\n", n->shc_x_file);
+	fprintf(o, "    if (%s()) {exit(1);}\n", n->rt_make);
+	fprintf(o, "    setenv(\"LD_PRELOAD\",\"/tmp/%s.so\",1);\n", n->tmp_prefix);
+	fprintf(o, "    if(pid==0) {\n");
+	fprintf(o, "        if (ptrace(PTRACE_TRACEME, 0, 0, 0) < 0) {\n");
+	fprintf(o, "            kill(getpid(), SIGKILL);\n");
+	fprintf(o, "            _exit(1);\n");
+	fprintf(o, "        }\n");
+	fprintf(o, "        %s(tmp2, len);\n", n->cc_crypt);
+	fprintf(o, "        system(tmp2);\n");
+	fprintf(o, "        memcpy(tmp2, str, len);\n");
+	fprintf(o, "        remove(\"/tmp/%s.so\");\n", n->tmp_prefix);
+	fprintf(o, "        ptrace(PTRACE_DETACH, 0, 0, 0);\n");
+	fprintf(o, "        exit(0);\n");
+	fprintf(o, "    }\n");
+	fprintf(o, "    else {wait(&status);}\n");
+	fprintf(o, "    %s();\n", n->seccomp_hardening);
+	fprintf(o, "    exit(0);\n");
+	fprintf(o, "}\n");
+	fprintf(o, "#endif /* HARDENING */\n\n");
+
+	/* key_with_file */
+	fprintf(o, "int %s(char * file)\n{\n", n->key_with_file);
+	fprintf(o, "\tstruct stat statf[1];\n");
+	fprintf(o, "\tstruct stat control[1];\n");
+	fprintf(o, "\tif (stat(file, statf) < 0) return -1;\n");
+	fprintf(o, "\tmemset(control, 0, sizeof(control));\n");
+	fprintf(o, "\tcontrol->st_ino = statf->st_ino;\n");
+	fprintf(o, "\tcontrol->st_dev = statf->st_dev;\n");
+	fprintf(o, "\tcontrol->st_rdev = statf->st_rdev;\n");
+	fprintf(o, "\tcontrol->st_uid = statf->st_uid;\n");
+	fprintf(o, "\tcontrol->st_gid = statf->st_gid;\n");
+	fprintf(o, "\tcontrol->st_size = statf->st_size;\n");
+	fprintf(o, "\tcontrol->st_mtime = statf->st_mtime;\n");
+	fprintf(o, "\tcontrol->st_ctime = statf->st_ctime;\n");
+	fprintf(o, "\t%s(control, sizeof(control));\n", n->cc_key_mix);
+	fprintf(o, "\treturn 0;\n");
+	fprintf(o, "}\n\n");
+
+	/* debugexec */
+	fprintf(o, "#if DEBUGEXEC\n");
+	fprintf(o, "void %s(char * sh11, int argc, char ** argv)\n{\n", n->debugexec);
+	fprintf(o, "\tint i;\n");
+	fprintf(o, "\tfprintf(stderr, \"shll=%%s\\n\", sh11 ? sh11 : \"<null>\");\n");
+	fprintf(o, "\tfprintf(stderr, \"argc=%%d\\n\", argc);\n");
+	fprintf(o, "\tif (!argv) {\n");
+	fprintf(o, "\t\tfprintf(stderr, \"argv=<null>\\n\");\n");
+	fprintf(o, "\t} else {\n");
+	fprintf(o, "\t\tfor (i = 0; i <= argc; i++)\n");
+	fprintf(o, "\t\t\tfprintf(stderr, \"argv[%%d]=%%.60s\\n\", i, argv[i] ? argv[i] : \"<null>\");\n");
+	fprintf(o, "\t}\n");
+	fprintf(o, "}\n");
+	fprintf(o, "#endif /* DEBUGEXEC */\n\n");
+
+	/* rmarg */
+	fprintf(o, "void %s(char ** argv, char * arg)\n{\n", n->rmarg);
+	fprintf(o, "\tfor (; argv && *argv && *argv != arg; argv++);\n");
+	fprintf(o, "\tfor (; argv && *argv; argv++) *argv = argv[1];\n");
+	fprintf(o, "}\n\n");
+
+	/* chkenv with randomized env prefix */
+	fprintf(o, "void %s(void);\n\n", n->chkenv_end);
+
+	fprintf(o, "int %s(int argc)\n{\n", n->chkenv);
+	fprintf(o, "\tchar buff[512];\n");
+	fprintf(o, "\tunsigned long mask, m;\n");
+	fprintf(o, "\tint l, a, c;\n");
+	fprintf(o, "\tchar * string;\n");
+	fprintf(o, "\textern char ** environ;\n\n");
+	fprintf(o, "\tmask = (unsigned long)getpid();\n");
+	fprintf(o, "\t%s();\n", n->cc_init);
+	fprintf(o, "\t%s(&%s, (void*)&%s - (void*)&%s);\n", n->cc_key_mix, n->chkenv, n->chkenv_end, n->chkenv);
+	fprintf(o, "\t%s(&%s, sizeof(%s));\n", n->cc_key_mix, n->data_var, n->data_var);
+	fprintf(o, "\t%s(&mask, sizeof(mask));\n", n->cc_key_mix);
+	fprintf(o, "\t%s(&mask, sizeof(mask));\n", n->cc_crypt);
+	fprintf(o, "\tsprintf(buff, \"%s%%lx\", mask);\n", n->env_prefix);
+	fprintf(o, "\tstring = getenv(buff);\n");
+	fprintf(o, "#if DEBUGEXEC\n");
+	fprintf(o, "\tfprintf(stderr, \"getenv(%%s)=%%s\\n\", buff, string ? string : \"<null>\");\n");
+	fprintf(o, "#endif\n");
+	fprintf(o, "\tl = strlen(buff);\n");
+	fprintf(o, "\tif (!string) {\n");
+	fprintf(o, "\t\tsprintf(&buff[l], \"=%%lu %%d\", mask, argc);\n");
+	fprintf(o, "\t\tputenv(strdup(buff));\n");
+	fprintf(o, "\t\treturn 0;\n");
+	fprintf(o, "\t}\n");
+	fprintf(o, "\tc = sscanf(string, \"%%lu %%d%%c\", &m, &a, buff);\n");
+	fprintf(o, "\tif (c == 2 && m == mask) {\n");
+	fprintf(o, "\t\t%s(environ, &string[-l - 1]);\n", n->rmarg);
+	fprintf(o, "\t\treturn 1 + (argc - a);\n");
+	fprintf(o, "\t}\n");
+	fprintf(o, "\treturn -1;\n");
+	fprintf(o, "}\n\n");
+
+	fprintf(o, "void %s(void){}\n\n", n->chkenv_end);
+
+	/* XOR-encoded string support */
+	emit_xor_decode_func(o);
+
+	/* HARDENING: gets_process_name and hardening() with XOR strings */
+	fprintf(o, "#if HARDENING\n\n");
+
+	/* Emit XOR-encoded strings for hardening */
+	emit_xor_string(o, "_s_procfmt", "/proc/%d/cmdline");
+	emit_xor_string(o, "_s_opnotperm", "Operation not permitted\n");
+
+	/* Parent process whitelist — XOR encoded */
+	{
+		static const char * parents[] = {
+			"bash", "/bin/bash", "sh", "/bin/sh",
+			"sudo", "/bin/sudo", "/usr/bin/sudo",
+			"gksudo", "/bin/gksudo", "/usr/bin/gksudo",
+			"kdesu", "/bin/kdesu", "/usr/bin/kdesu",
+			NULL
+		};
+		int pi;
+		fprintf(o, "#define _N_PARENTS %d\n", 13);
+		for (pi = 0; parents[pi]; pi++) {
+			char vn[16];
+			snprintf(vn, sizeof(vn), "_s_p%d", pi);
+			emit_xor_string(o, vn, parents[pi]);
+		}
+	}
+
+	fprintf(o, "\nstatic void %s(const pid_t pid, char * name) {\n", n->gets_pname);
+	fprintf(o, "\tchar procfile[BUFSIZ];\n");
+	fprintf(o, "\t_xd(_s_procfmt, _s_procfmt_n, _s_procfmt_k);\n");
+	fprintf(o, "\tsprintf(procfile, (char*)_s_procfmt, pid);\n");
+	fprintf(o, "\t_xd(_s_procfmt, _s_procfmt_n, _s_procfmt_k);\n");
+	fprintf(o, "\tFILE* f = fopen(procfile, \"r\");\n");
+	fprintf(o, "\tif (f) {\n");
+	fprintf(o, "\t\tsize_t size = fread(name, sizeof(char), sizeof(procfile), f);\n");
+	fprintf(o, "\t\tif (size > 0 && '\\n' == name[size - 1]) name[size - 1] = '\\0';\n");
+	fprintf(o, "\t\tfclose(f);\n");
+	fprintf(o, "\t}\n");
+	fprintf(o, "}\n\n");
+
+	fprintf(o, "void %s() {\n", n->hardening);
+	fprintf(o, "    prctl(PR_SET_DUMPABLE, 0);\n");
+	fprintf(o, "    prctl(PR_SET_PTRACER, -1);\n");
+	fprintf(o, "    int pid = getppid();\n");
+	fprintf(o, "    char name[256] = {0};\n");
+	fprintf(o, "    %s(pid, name);\n", n->gets_pname);
+	fprintf(o, "    int ok = 0;\n");
+	fprintf(o, "    unsigned char * _plist[] = {_s_p0,_s_p1,_s_p2,_s_p3,_s_p4,_s_p5,_s_p6,_s_p7,_s_p8,_s_p9,_s_p10,_s_p11,_s_p12};\n");
+	fprintf(o, "    unsigned char _pkeys[] = {_s_p0_k,_s_p1_k,_s_p2_k,_s_p3_k,_s_p4_k,_s_p5_k,_s_p6_k,_s_p7_k,_s_p8_k,_s_p9_k,_s_p10_k,_s_p11_k,_s_p12_k};\n");
+	fprintf(o, "    int _pns[] = {_s_p0_n,_s_p1_n,_s_p2_n,_s_p3_n,_s_p4_n,_s_p5_n,_s_p6_n,_s_p7_n,_s_p8_n,_s_p9_n,_s_p10_n,_s_p11_n,_s_p12_n};\n");
+	fprintf(o, "    int pi;\n");
+	fprintf(o, "    for (pi = 0; pi < _N_PARENTS; pi++) {\n");
+	fprintf(o, "        _xd(_plist[pi], _pns[pi], _pkeys[pi]);\n");
+	fprintf(o, "        if (strcmp(name, (char*)_plist[pi]) == 0) ok = 1;\n");
+	fprintf(o, "        _xd(_plist[pi], _pns[pi], _pkeys[pi]);\n");
+	fprintf(o, "        if (ok) break;\n");
+	fprintf(o, "    }\n");
+	fprintf(o, "    if (!ok) {\n");
+	fprintf(o, "        _xd(_s_opnotperm, _s_opnotperm_n, _s_opnotperm_k);\n");
+	fprintf(o, "        printf(\"%%s\", (char*)_s_opnotperm);\n");
+	fprintf(o, "        _xd(_s_opnotperm, _s_opnotperm_n, _s_opnotperm_k);\n");
+	fprintf(o, "        kill(getpid(), SIGKILL);\n");
+	fprintf(o, "        exit(1);\n");
+	fprintf(o, "    }\n");
+	fprintf(o, "}\n");
+	fprintf(o, "#endif /* HARDENING */\n\n");
+
+	/* untraceable */
+	fprintf(o, "#if !TRACEABLE\n\n");
+	fprintf(o, "#define _LINUX_SOURCE_COMPAT\n");
+	fprintf(o, "#include <sys/ptrace.h>\n");
+	fprintf(o, "#include <sys/types.h>\n");
+	fprintf(o, "#include <sys/wait.h>\n");
+	fprintf(o, "#include <fcntl.h>\n");
+	fprintf(o, "#include <signal.h>\n");
+	fprintf(o, "#include <stdio.h>\n");
+	fprintf(o, "#include <unistd.h>\n\n");
+
+	fprintf(o, "#if !defined(PT_ATTACHEXC)\n");
+	fprintf(o, "   #if !defined(PTRACE_ATTACH) && defined(PT_ATTACH)\n");
+	fprintf(o, "       #define PT_ATTACHEXC PT_ATTACH\n");
+	fprintf(o, "   #elif defined(PTRACE_ATTACH)\n");
+	fprintf(o, "       #define PT_ATTACHEXC PTRACE_ATTACH\n");
+	fprintf(o, "   #endif\n");
+	fprintf(o, "#endif\n\n");
+
+	/* XOR-encode the /proc format strings for untraceable */
+	emit_xor_string(o, "_s_procmem", "/proc/%d/mem");
+	emit_xor_string(o, "_s_procas", "/proc/%d/as");
+
+	fprintf(o, "void %s(char * argv0)\n{\n", n->untraceable);
+	fprintf(o, "\tchar proc[80];\n");
+	fprintf(o, "\tint pid, mine;\n\n");
+	fprintf(o, "\tswitch(pid = fork()) {\n");
+	fprintf(o, "\tcase  0:\n");
+	fprintf(o, "\t\tpid = getppid();\n");
+	fprintf(o, "#if defined(__FreeBSD__)\n");
+	fprintf(o, "\t\t_xd(_s_procmem, _s_procmem_n, _s_procmem_k);\n");
+	fprintf(o, "\t\tsprintf(proc, (char*)_s_procmem, (int)pid);\n");
+	fprintf(o, "\t\t_xd(_s_procmem, _s_procmem_n, _s_procmem_k);\n");
+	fprintf(o, "#else\n");
+	fprintf(o, "\t\t_xd(_s_procas, _s_procas_n, _s_procas_k);\n");
+	fprintf(o, "\t\tsprintf(proc, (char*)_s_procas, (int)pid);\n");
+	fprintf(o, "\t\t_xd(_s_procas, _s_procas_n, _s_procas_k);\n");
+	fprintf(o, "#endif\n");
+	fprintf(o, "\t\tclose(0);\n");
+	fprintf(o, "\t\tmine = !open(proc, O_RDWR|O_EXCL);\n");
+	fprintf(o, "\t\tif (!mine && errno != EBUSY)\n");
+	fprintf(o, "\t\t\tmine = !ptrace(PT_ATTACHEXC, pid, 0, 0);\n");
+	fprintf(o, "\t\tif (mine) {\n");
+	fprintf(o, "\t\t\tkill(pid, SIGCONT);\n");
+	fprintf(o, "\t\t} else {\n");
+	fprintf(o, "\t\t\tperror(argv0);\n");
+	fprintf(o, "\t\t\tkill(pid, SIGKILL);\n");
+	fprintf(o, "\t\t}\n");
+	fprintf(o, "\t\t_exit(mine);\n");
+	fprintf(o, "\tcase -1:\n");
+	fprintf(o, "\t\tbreak;\n");
+	fprintf(o, "\tdefault:\n");
+	fprintf(o, "\t\tif (pid == waitpid(pid, 0, 0)) return;\n");
+	fprintf(o, "\t}\n");
+	fprintf(o, "\tperror(argv0);\n");
+	fprintf(o, "\t_exit(1);\n");
+	fprintf(o, "}\n");
+	fprintf(o, "#endif /* !TRACEABLE */\n\n");
+
+	/* xsh — main decryption/execution function */
+	fprintf(o, "char * %s(int argc, char ** argv)\n{\n", n->xsh);
+	fprintf(o, "\tchar * scrpt;\n");
+	fprintf(o, "\tint ret, i, j;\n");
+	fprintf(o, "\tchar ** varg;\n");
+	fprintf(o, "\tchar * me = argv[0];\n");
+	fprintf(o, "\tif (me == NULL) { me = getenv(\"_\"); }\n");
+	fprintf(o, "\tif (me == 0) { fprintf(stderr, \"E: argv[0] unavailable.\"); exit(1); }\n\n");
+
+	fprintf(o, "\tret = %s(argc);\n", n->chkenv);
+	fprintf(o, "\t%s();\n", n->cc_init);
+	fprintf(o, "\t%s(pswd, pswd_z);\n", n->cc_key_mix);
+	fprintf(o, "\t%s(msg1, msg1_z);\n", n->cc_crypt);
+	fprintf(o, "\t%s(date, date_z);\n", n->cc_crypt);
+	fprintf(o, "\tif (date[0] && (atoll(date)<time(NULL)))\n");
+	fprintf(o, "\t\treturn msg1;\n");
+	fprintf(o, "\t%s(shll, shll_z);\n", n->cc_crypt);
+	fprintf(o, "\t%s(inlo, inlo_z);\n", n->cc_crypt);
+	fprintf(o, "\t%s(xecc, xecc_z);\n", n->cc_crypt);
+	fprintf(o, "\t%s(lsto, lsto_z);\n", n->cc_crypt);
+	fprintf(o, "\t%s(tst1, tst1_z);\n", n->cc_crypt);
+	/* MAC check for tst1: compute MAC of decrypted tst1, compare with chk1 */
+	fprintf(o, "\t{ unsigned char _tag[32];\n");
+	fprintf(o, "\t  %s(tst1, tst1_z, _tag);\n", n->cc_mac);
+	fprintf(o, "\t  if (chk1_z != 32 || memcmp(_tag, chk1, 32)) return tst1;\n");
+	fprintf(o, "\t}\n");
+	fprintf(o, "\t%s(msg2, msg2_z);\n", n->cc_crypt);
+	fprintf(o, "\tif (ret < 0)\n");
+	fprintf(o, "\t\treturn msg2;\n");
+	fprintf(o, "\tvarg = (char **)calloc(argc + 10, sizeof(char *));\n");
+	fprintf(o, "\tif (!varg) return 0;\n");
+	fprintf(o, "\tif (ret) {\n");
+	fprintf(o, "\t\t%s(rlax, rlax_z);\n", n->cc_crypt);
+	fprintf(o, "\t\tif (!rlax[0] && %s(shll))\n", n->key_with_file);
+	fprintf(o, "\t\t\treturn shll;\n");
+	fprintf(o, "\t\t%s(opts, opts_z);\n", n->cc_crypt);
+	fprintf(o, "#if HARDENING\n");
+	fprintf(o, "\t\t%s(text, text_z);\n", n->hardrun);
+	fprintf(o, "\t\texit(0);\n");
+	fprintf(o, "\t\t%s();\n", n->seccomp_hardening);
+	fprintf(o, "#endif\n");
+	fprintf(o, "\t\t%s(text, text_z);\n", n->cc_crypt);
+	fprintf(o, "\t\t%s(tst2, tst2_z);\n", n->cc_crypt);
+	/* MAC check for tst2 */
+	fprintf(o, "\t\t{ unsigned char _tag[32];\n");
+	fprintf(o, "\t\t  %s(tst2, tst2_z, _tag);\n", n->cc_mac);
+	fprintf(o, "\t\t  if (chk2_z != 32 || memcmp(_tag, chk2, 32)) return tst2;\n");
+	fprintf(o, "\t\t}\n");
+	fprintf(o, "\t\tscrpt = malloc(hide_z + text_z);\n");
+	fprintf(o, "\t\tif (!scrpt) return 0;\n");
+	fprintf(o, "\t\tmemset(scrpt, (int) ' ', hide_z);\n");
+	fprintf(o, "\t\tmemcpy(&scrpt[hide_z], text, text_z);\n");
+	fprintf(o, "\t} else {\n");
+	fprintf(o, "\t\tif (*xecc) {\n");
+	fprintf(o, "\t\t\tscrpt = malloc(512);\n");
+	fprintf(o, "\t\t\tif (!scrpt) return 0;\n");
+	fprintf(o, "\t\t\tsprintf(scrpt, xecc, me);\n");
+	fprintf(o, "\t\t} else {\n");
+	fprintf(o, "\t\t\tscrpt = me;\n");
+	fprintf(o, "\t\t}\n");
+	fprintf(o, "\t}\n");
+	fprintf(o, "\tj = 0;\n");
+	fprintf(o, "#if BUSYBOXON\n");
+	fprintf(o, "\tvarg[j++] = \"busybox\";\n");
+	fprintf(o, "\tvarg[j++] = \"sh\";\n");
+	fprintf(o, "#else\n");
+	fprintf(o, "\tvarg[j++] = argv[0];\n");
+	fprintf(o, "#endif\n");
+	fprintf(o, "\tif (ret && *opts) varg[j++] = opts;\n");
+	fprintf(o, "\tif (*inlo) varg[j++] = inlo;\n");
+	fprintf(o, "\tvarg[j++] = scrpt;\n");
+	fprintf(o, "\tif (*lsto) varg[j++] = lsto;\n");
+	fprintf(o, "\ti = (ret > 1) ? ret : 0;\n");
+	fprintf(o, "\twhile (i < argc) varg[j++] = argv[i++];\n");
+	fprintf(o, "\tvarg[j] = 0;\n");
+	fprintf(o, "#if DEBUGEXEC\n");
+	fprintf(o, "\t%s(shll, j, varg);\n", n->debugexec);
+	fprintf(o, "#endif\n");
+	fprintf(o, "\texecvp(shll, varg);\n");
+	fprintf(o, "\treturn shll;\n");
+	fprintf(o, "}\n\n");
+
+	/* main */
+	fprintf(o, "int main(int argc, char ** argv)\n{\n");
+	fprintf(o, "#if SETUID\n");
+	fprintf(o, "   setuid(0);\n");
+	fprintf(o, "#endif\n");
+	fprintf(o, "#if DEBUGEXEC\n");
+	fprintf(o, "\t%s(\"main\", argc, argv);\n", n->debugexec);
+	fprintf(o, "#endif\n");
+	fprintf(o, "#if HARDENING\n");
+	fprintf(o, "\t%s();\n", n->hardening);
+	fprintf(o, "#endif\n");
+	fprintf(o, "#if !TRACEABLE\n");
+	fprintf(o, "\t%s(argv[0]);\n", n->untraceable);
+	fprintf(o, "#endif\n");
+	fprintf(o, "\targv[1] = %s(argc, argv);\n", n->xsh);
+	fprintf(o, "\tfprintf(stderr, \"%%s%%s%%s: %%s\\n\", argv[0],\n");
+	fprintf(o, "\t\terrno ? \": \" : \"\",\n");
+	fprintf(o, "\t\terrno ? strerror(errno) : \"\",\n");
+	fprintf(o, "\t\targv[1] ? argv[1] : \"<null>\"\n");
+	fprintf(o, "\t);\n");
+	fprintf(o, "\treturn 1;\n");
+	fprintf(o, "}\n");
+}
 
 static int parse_an_arg(int argc, char * argv[])
 {
@@ -902,60 +1019,163 @@ static void parse_args(int argc, char * argv[])
 	}
 }
 
-/* 'Alleged RC4' */
+/* ChaCha20 stream cipher */
 
-static unsigned char stte[256], indx, jndx, kndx;
+static unsigned char cc_key[32];
+static unsigned char cc_nonce[12];
+static unsigned int  cc_counter;
+static unsigned char cc_buf[64];
+static int           cc_buf_pos;
 
-/*
- * Reset arc4 stte. 
- */
-void stte_0(void)
+#define CC_ROTL(x,n) (((x)<<(n))|((x)>>(32-(n))))
+#define CC_QR(a,b,c,d) \
+	a+=b; d^=a; d=CC_ROTL(d,16); \
+	c+=d; b^=c; b=CC_ROTL(b,12); \
+	a+=b; d^=a; d=CC_ROTL(d, 8); \
+	c+=d; b^=c; b=CC_ROTL(b, 7);
+
+static void cc_block(unsigned int out[16], const unsigned int in[16])
 {
-	indx = jndx = kndx = 0;
-	do {
-		stte[indx] = indx;
-	} while (++indx);
+	int i;
+	for (i = 0; i < 16; i++) out[i] = in[i];
+	for (i = 0; i < 10; i++) {
+		CC_QR(out[0],out[4],out[ 8],out[12]);
+		CC_QR(out[1],out[5],out[ 9],out[13]);
+		CC_QR(out[2],out[6],out[10],out[14]);
+		CC_QR(out[3],out[7],out[11],out[15]);
+		CC_QR(out[0],out[5],out[10],out[15]);
+		CC_QR(out[1],out[6],out[11],out[12]);
+		CC_QR(out[2],out[7],out[ 8],out[13]);
+		CC_QR(out[3],out[4],out[ 9],out[14]);
+	}
+	for (i = 0; i < 16; i++) out[i] += in[i];
 }
 
-/*
- * Set key. Can be used more than once. 
- */
-void key(void * str, int len)
+static void cc_keystream(unsigned char out[64])
 {
-	unsigned char tmp, * ptr = (unsigned char *)str;
-	while (len > 0) {
-		do {
-			tmp = stte[indx];
-			kndx += tmp;
-			kndx += ptr[(int)indx % len];
-			stte[indx] = stte[kndx];
-			stte[kndx] = tmp;
-		} while (++indx);
-		ptr += 256;
-		len -= 256;
+	unsigned int state[16], blk[16];
+	/* "expand 32-byte k" */
+	state[0]=0x61707865; state[1]=0x3320646e;
+	state[2]=0x79622d32; state[3]=0x6b206574;
+	/* key (little-endian) */
+	int i;
+	for (i = 0; i < 8; i++)
+		state[4+i] = (unsigned int)cc_key[i*4]
+			| ((unsigned int)cc_key[i*4+1]<<8)
+			| ((unsigned int)cc_key[i*4+2]<<16)
+			| ((unsigned int)cc_key[i*4+3]<<24);
+	state[12] = cc_counter++;
+	for (i = 0; i < 3; i++)
+		state[13+i] = (unsigned int)cc_nonce[i*4]
+			| ((unsigned int)cc_nonce[i*4+1]<<8)
+			| ((unsigned int)cc_nonce[i*4+2]<<16)
+			| ((unsigned int)cc_nonce[i*4+3]<<24);
+	cc_block(blk, state);
+	for (i = 0; i < 16; i++) {
+		out[i*4+0] = (unsigned char)(blk[i]);
+		out[i*4+1] = (unsigned char)(blk[i]>>8);
+		out[i*4+2] = (unsigned char)(blk[i]>>16);
+		out[i*4+3] = (unsigned char)(blk[i]>>24);
 	}
 }
 
-/*
- * Crypt data. 
- */
-void arc4(void * str, int len)
+void cc_init(void)
 {
-	unsigned char tmp, * ptr = (unsigned char *)str;
-	while (len > 0) {
-		indx++;
-		tmp = stte[indx];
-		jndx += tmp;
-		stte[indx] = stte[jndx];
-		stte[jndx] = tmp;
-		tmp += stte[indx];
-		*ptr ^= stte[tmp];
-		ptr++;
-		len--;
+	memset(cc_key, 0, 32);
+	memset(cc_nonce, 0, 12);
+	cc_counter = 0;
+	cc_buf_pos = 64; /* force new block on first use */
+}
+
+void cc_key_mix(void * str, int len)
+{
+	unsigned char * ptr = (unsigned char *)str;
+	int i;
+	for (i = 0; i < len; i++) {
+		cc_key[i % 32] ^= ptr[i];
+		cc_nonce[i % 12] ^= ptr[i];
+	}
+	/* Avalanche: run one ChaCha20 block and use output as new key+nonce */
+	unsigned char tmp[64];
+	cc_counter = 0;
+	cc_keystream(tmp);
+	memcpy(cc_key, tmp, 32);
+	memcpy(cc_nonce, tmp + 32, 12);
+	cc_counter = 0;
+	cc_buf_pos = 64;
+}
+
+void cc_crypt(void * str, int len)
+{
+	unsigned char * ptr = (unsigned char *)str;
+	int i;
+	for (i = 0; i < len; i++) {
+		if (cc_buf_pos >= 64) {
+			cc_keystream(cc_buf);
+			cc_buf_pos = 0;
+		}
+		ptr[i] ^= cc_buf[cc_buf_pos++];
 	}
 }
 
-/* End of ARC4 */
+/* ChaCha20 MAC: compute a 32-byte tag over data using current key state */
+void cc_mac(void * str, int len, unsigned char tag[32])
+{
+	unsigned char mac_key[32], mac_nonce[12];
+	unsigned char blk[64];
+	unsigned char * ptr = (unsigned char *)str;
+	int i;
+
+	/* Save and set up MAC state with a different nonce */
+	memcpy(mac_key, cc_key, 32);
+	memcpy(mac_nonce, cc_nonce, 12);
+	mac_nonce[0] ^= 0xff; /* differentiate from encryption */
+
+	/* Process data in 32-byte chunks, mixing with ChaCha20 blocks */
+	unsigned char saved_key[32], saved_nonce[12];
+	unsigned int saved_ctr;
+	int saved_pos;
+	memcpy(saved_key, cc_key, 32);
+	memcpy(saved_nonce, cc_nonce, 12);
+	saved_ctr = cc_counter;
+	saved_pos = cc_buf_pos;
+
+	memcpy(cc_key, mac_key, 32);
+	memcpy(cc_nonce, mac_nonce, 12);
+	cc_counter = 0;
+
+	/* Feed length first */
+	unsigned char lenbuf[4];
+	lenbuf[0] = (unsigned char)(len);
+	lenbuf[1] = (unsigned char)(len >> 8);
+	lenbuf[2] = (unsigned char)(len >> 16);
+	lenbuf[3] = (unsigned char)(len >> 24);
+	for (i = 0; i < 4; i++)
+		cc_key[i] ^= lenbuf[i];
+
+	/* Mix data into key and generate blocks */
+	for (i = 0; i < len; i++) {
+		cc_key[i % 32] ^= ptr[i];
+		if ((i % 32) == 31 || i == len - 1) {
+			cc_counter = 0;
+			cc_keystream(blk);
+			memcpy(cc_key, blk, 32);
+		}
+	}
+
+	/* Final output */
+	cc_counter = 0;
+	cc_keystream(blk);
+	memcpy(tag, blk, 32);
+
+	/* Restore cipher state */
+	memcpy(cc_key, saved_key, 32);
+	memcpy(cc_nonce, saved_nonce, 12);
+	cc_counter = saved_ctr;
+	cc_buf_pos = saved_pos;
+}
+
+/* End of ChaCha20 */
 
 /*
  * Key with file invariants.
@@ -978,7 +1198,7 @@ int key_with_file(char * file)
 	control->st_size = statf->st_size;
 	control->st_mtime = statf->st_mtime;
 	control->st_ctime = statf->st_ctime;
-	key(control, sizeof(control));
+	cc_key_mix(control, sizeof(control));
 	return 0;
 }
 
@@ -1143,6 +1363,7 @@ int noise(char * ptr, unsigned min, unsigned xtra, int str)
 }
 
 static int offset;
+static const char * data_var_name = "data";
 
 void prnt_bytes(FILE * o, char * ptr, int m, int l, int n)
 {
@@ -1153,7 +1374,7 @@ void prnt_bytes(FILE * o, char * ptr, int m, int l, int n)
 	for (i = 0; i < n; i++) {
 		if ((i & 0xf) == 0)
 			fprintf(o, "\n\t\"");
-		fprintf(o, "\\%03o", (unsigned char)((i>=m) && (i<l) ? ptr[i-m] : rand_chr()));
+		fprintf(o, "\\x%02x", (unsigned char)((i>=m) && (i<l) ? ptr[i-m] : rand_chr()));
 		if ((i & 0xf) == 0xf)
 			fprintf(o, "\"");
 	}
@@ -1171,13 +1392,13 @@ void prnt_array(FILE * o, void * ptr, char * name, int l, char * cast)
 	fprintf(o, "\n");
 	fprintf(o, "#define      %s_z	%d", name, l);
 	fprintf(o, "\n");
-	fprintf(o, "#define      %s	(%s(&data[%d]))", name, cast?cast:"", offset+m);
+	fprintf(o, "#define      %s	(%s(&%s[%d]))", name, cast?cast:"", data_var_name, offset+m);
 	prnt_bytes(o, ptr, m, l, n);
 }
 
 void dump_array(FILE * o, void * ptr, char * name, int l, char * cast)
 {
-	arc4(ptr, l);
+	cc_crypt(ptr, l);
 	prnt_array(o, ptr, name, l, cast);
 }
 
@@ -1195,8 +1416,8 @@ int write_C(char * file, char * argv[])
 	int lsto_z = strlen(lsto) + 1;
 	char* tst1 = strdup("location has changed!");
 	int tst1_z = strlen(tst1) + 1;
-	char* chk1 = strdup(tst1);
-	int chk1_z = tst1_z;
+	char* chk1 = calloc(32, 1);
+	int chk1_z = 32;
 	char* msg2 = strdup("abnormal behavior!");
 	int msg2_z = strlen(msg2) + 1;
 	int rlax_z = sizeof(rlax);
@@ -1204,8 +1425,8 @@ int write_C(char * file, char * argv[])
 	int text_z = strlen(text) + 1;
 	char* tst2 = strdup("shell has changed!");
 	int tst2_z = strlen(tst2) + 1;
-	char* chk2 = strdup(tst2);
-	int chk2_z = tst2_z;
+	char* chk2 = calloc(32, 1);
+	int chk2_z = 32;
 	char* name = strdup(file);
 	FILE * o;
 	int indx;
@@ -1213,36 +1434,56 @@ int write_C(char * file, char * argv[])
 	int done = 0;
 
 	/* Encrypt */
-	srand((unsigned)time(NULL)^(unsigned)getpid());
-	pswd_z = noise(pswd, pswd_z, 0, 0); numd++;
-	stte_0();
-	 key(pswd, pswd_z);
+	{
+		/* Seed from /dev/urandom if available */
+		FILE * urand = fopen("/dev/urandom", "r");
+		if (urand) {
+			unsigned seed;
+			if (fread(pswd, 1, pswd_z, urand) != (size_t)pswd_z)
+				memset(pswd, 0, pswd_z); /* fallback below */
+			if (fread(&seed, sizeof(seed), 1, urand) == 1)
+				srand(seed);
+			else
+				srand((unsigned)time(NULL)^(unsigned)getpid());
+			fclose(urand);
+		} else {
+			srand((unsigned)time(NULL)^(unsigned)getpid());
+			noise(pswd, pswd_z, 0, 0);
+		}
+	}
+	numd++;
+	cc_init();
+	cc_key_mix(pswd, pswd_z);
 	msg1_z += strlen(mail);
 	msg1 = strcat(realloc(msg1, msg1_z), mail);
-	arc4(msg1, msg1_z); numd++;
-	arc4(date, date_z); numd++;
-	arc4(shll, shll_z); numd++;
-	arc4(inlo, inlo_z); numd++;
-	arc4(xecc, xecc_z); numd++;
-	arc4(lsto, lsto_z); numd++;
-	arc4(tst1, tst1_z); numd++;
-	 key(chk1, chk1_z);
-	arc4(chk1, chk1_z); numd++;
-	arc4(msg2, msg2_z); numd++;
+	cc_crypt(msg1, msg1_z); numd++;
+	cc_crypt(date, date_z); numd++;
+	cc_crypt(shll, shll_z); numd++;
+	cc_crypt(inlo, inlo_z); numd++;
+	cc_crypt(xecc, xecc_z); numd++;
+	cc_crypt(lsto, lsto_z); numd++;
+	/* MAC-based integrity: compute tag of plaintext tst1 before encrypting it */
+	cc_mac(tst1, tst1_z, (unsigned char *)chk1); numd++;
+	cc_crypt(tst1, tst1_z); numd++;
+	cc_crypt(msg2, msg2_z); numd++;
 	indx = !rlax[0];
-	arc4(rlax, rlax_z); numd++;
+	cc_crypt(rlax, rlax_z); numd++;
 	if (indx && key_with_file(kwsh)) {
 		fprintf(stderr, "%s: invalid file name: %s ", my_name, kwsh);
 		perror("");
 		exit(1);
 	}
-	arc4(opts, opts_z); numd++;
-	arc4(text, text_z); numd++;
-	arc4(tst2, tst2_z); numd++;
-	 key(chk2, chk2_z);
-	arc4(chk2, chk2_z); numd++;
+	cc_crypt(opts, opts_z); numd++;
+	cc_crypt(text, text_z); numd++;
+	/* MAC-based integrity for tst2 */
+	cc_mac(tst2, tst2_z, (unsigned char *)chk2); numd++;
+	cc_crypt(tst2, tst2_z); numd++;
 
 	/* Output */
+	struct rt_names rtn;
+	init_rt_names(&rtn);
+	data_var_name = rtn.data_var;
+
 	name = strcat(realloc(name, strlen(name)+5), ".x.c");
 	o = fopen(name, "w");
 	if (!o) {
@@ -1250,13 +1491,7 @@ int write_C(char * file, char * argv[])
 		perror("");
 		exit(1);
 	}
-	fprintf(o, "#if 0\n");
-	fprintf(o, "\t%s %s, %s\n", my_name, version, subject);
-	fprintf(o, "\t%s %s %s %s\n\n\t", cpright, provider.f, provider.s, provider.e);
-	for (indx = 0; argv[indx]; indx++)
-		fprintf(o, "%s ", argv[indx]);
-	fprintf(o, "\n#endif\n\n");
-	fprintf(o, "static  char data [] = ");
+	fprintf(o, "static  char %s [] = ", rtn.data_var);
 	do {
 		done = 0;
 		indx = rand_mod(15);
@@ -1281,16 +1516,15 @@ int write_C(char * file, char * argv[])
 			indx = 0;
 		} while (!done);
 	} while (numd+=done);
-	fprintf(o, "/* End of data[] */;\n");
+	fprintf(o, ";\n");
 	fprintf(o, "#define      %s_z	%d\n", "hide", 1<<12);
 	fprintf(o, SETUID_line, SETUID_flag);
 	fprintf(o, DEBUGEXEC_line, DEBUGEXEC_flag);
 	fprintf(o, TRACEABLE_line, TRACEABLE_flag);
 	fprintf(o, HARDENING_line, HARDENING_flag);
-    fprintf(o, BUSYBOXON_line, BUSYBOXON_flag);
+	fprintf(o, BUSYBOXON_line, BUSYBOXON_flag);
 	fprintf(o, MMAP2_line, MMAP2_flag);
-	for (indx = 0; RTC[indx]; indx++)
-		fprintf(o, "%s\n", RTC[indx]);
+	emit_runtime(o, &rtn);
 	fflush(o);
 	fclose(o);
 
