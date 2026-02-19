@@ -177,6 +177,8 @@ struct rt_names {
 	char cc_buf_pos_var[24];
 	char xor_decode[24];
 	char xor_prefix[8];
+	char inline_getenv[24];
+	char inline_setenv[24];
 	unsigned int cc_consts[4];
 	int cc_rotations[4];
 	char rotl_macro[24];
@@ -233,6 +235,8 @@ static void init_rt_names(struct rt_names * n)
 	gen_rt_name(n->cc_buf_var, sizeof(n->cc_buf_var));
 	gen_rt_name(n->cc_buf_pos_var, sizeof(n->cc_buf_pos_var));
 	gen_rt_name(n->xor_decode, sizeof(n->xor_decode));
+	gen_rt_name(n->inline_getenv, sizeof(n->inline_getenv));
+	gen_rt_name(n->inline_setenv, sizeof(n->inline_setenv));
 	/* xor prefix: 2-4 lowercase chars */
 	{
 		int len = 2 + rand_mod(3);
@@ -392,8 +396,12 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "#include <stdlib.h>\n");
 	fprintf(o, "#include <string.h>\n");
 	fprintf(o, "#include <time.h>\n");
+	fprintf(o, "#include <sys/time.h>\n");
 	fprintf(o, "#include <unistd.h>\n");
-	fprintf(o, "#include <dlfcn.h>\n\n");
+	fprintf(o, "#include <dlfcn.h>\n");
+	fprintf(o, "#ifdef __linux__\n");
+	fprintf(o, "#include <sys/syscall.h>\n");
+	fprintf(o, "#endif\n\n");
 
 	/* ChaCha20 implementation with randomized names */
 	fprintf(o, "static unsigned char %s[32];\n", n->cc_key_var);
@@ -558,6 +566,49 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\t%s=sc; %s=sp;\n", n->cc_counter_var, n->cc_buf_pos_var);
 	fprintf(o, "}\n\n");
 
+	/* inline getenv helper — searches environ directly, removes getenv from PLT */
+	fprintf(o, "static char *%s(const char *n) {\n", n->inline_getenv);
+	fprintf(o, "\textern char **environ;\n");
+	fprintf(o, "\tchar **e; int l = 0;\n");
+	fprintf(o, "\twhile (n[l]) l++;\n");
+	fprintf(o, "\tfor (e = environ; e && *e; e++) {\n");
+	fprintf(o, "\t\tint i, m = 1;\n");
+	fprintf(o, "\t\tfor (i = 0; i < l; i++) if ((*e)[i] != n[i]) { m = 0; break; }\n");
+	fprintf(o, "\t\tif (m && (*e)[l] == '=') return &(*e)[l+1];\n");
+	fprintf(o, "\t}\n");
+	fprintf(o, "\treturn 0;\n");
+	fprintf(o, "}\n\n");
+
+	/* inline setenv helper — manipulates environ directly, removes setenv/dlsym from PLT */
+	fprintf(o, "static void %s(const char *k, const char *v) {\n", n->inline_setenv);
+	fprintf(o, "\textern char **environ;\n");
+	fprintf(o, "\tint kl = 0, vl = 0, cnt = 0;\n");
+	fprintf(o, "\twhile (k[kl]) kl++;\n");
+	fprintf(o, "\twhile (v[vl]) vl++;\n");
+	fprintf(o, "\tchar **e;\n");
+	fprintf(o, "\tfor (e = environ; *e; e++) {\n");
+	fprintf(o, "\t\tint i, m = 1;\n");
+	fprintf(o, "\t\tfor (i = 0; i < kl; i++) if ((*e)[i] != k[i]) { m = 0; break; }\n");
+	fprintf(o, "\t\tif (m && (*e)[kl] == '=') {\n");
+	fprintf(o, "\t\t\tchar *nv = malloc(kl + 1 + vl + 1);\n");
+	fprintf(o, "\t\t\tmemcpy(nv, k, kl); nv[kl] = '=';\n");
+	fprintf(o, "\t\t\tmemcpy(nv+kl+1, v, vl+1);\n");
+	fprintf(o, "\t\t\t*e = nv;\n");
+	fprintf(o, "\t\t\treturn;\n");
+	fprintf(o, "\t\t}\n");
+	fprintf(o, "\t\tcnt++;\n");
+	fprintf(o, "\t}\n");
+	fprintf(o, "\t{\n");
+	fprintf(o, "\t\tchar *nv = malloc(kl + 1 + vl + 1);\n");
+	fprintf(o, "\t\tmemcpy(nv, k, kl); nv[kl] = '=';\n");
+	fprintf(o, "\t\tmemcpy(nv+kl+1, v, vl+1);\n");
+	fprintf(o, "\t\tchar **ne = malloc((cnt + 2) * sizeof(char *));\n");
+	fprintf(o, "\t\tmemcpy(ne, environ, cnt * sizeof(char *));\n");
+	fprintf(o, "\t\tne[cnt] = nv; ne[cnt+1] = 0;\n");
+	fprintf(o, "\t\tenviron = ne;\n");
+	fprintf(o, "\t}\n");
+	fprintf(o, "}\n\n");
+
 	/* HARDENING section */
 	fprintf(o, "#if HARDENING\n\n");
 	fprintf(o, "#include <sys/ptrace.h>\n");
@@ -615,7 +666,7 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "int %s() {\n", n->rt_make);
 	fprintf(o, "\tchar * cc;\n");
 	fprintf(o, "    char cmd[4096];\n");
-	fprintf(o, "\tcc = getenv(\"CC\");\n");
+	fprintf(o, "\tcc = %s(\"CC\");\n", n->inline_getenv);
 	fprintf(o, "\tif (!cc) cc = \"cc\";\n");
 	fprintf(o, "\tsprintf(cmd, \"%%s %%s -o %%s %%s\", cc, \"-Wall -fpic -shared\", \"/tmp/%s.so\", \"/tmp/%s.c -ldl\");\n", n->tmp_prefix, n->tmp_prefix);
 	fprintf(o, "\tif (system(cmd)) {remove(\"/tmp/%s.c\"); return -1;}\n", n->tmp_prefix);
@@ -630,10 +681,14 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "    pid = fork();\n");
 	fprintf(o, "    %s();\n", n->shc_x_file);
 	fprintf(o, "    if (%s()) {exit(1);}\n", n->rt_make);
-	fprintf(o, "    setenv(\"LD_PRELOAD\",\"/tmp/%s.so\",1);\n", n->tmp_prefix);
+	fprintf(o, "    %s(\"LD_PRELOAD\",\"/tmp/%s.so\");\n", n->inline_setenv, n->tmp_prefix);
 	fprintf(o, "    if(pid==0) {\n");
 	fprintf(o, "        if (ptrace(PTRACE_TRACEME, 0, 0, 0) < 0) {\n");
+	fprintf(o, "#ifdef __linux__\n");
+	fprintf(o, "            kill(syscall(SYS_getpid), SIGKILL);\n");
+	fprintf(o, "#else\n");
 	fprintf(o, "            kill(getpid(), SIGKILL);\n");
+	fprintf(o, "#endif\n");
 	fprintf(o, "            _exit(1);\n");
 	fprintf(o, "        }\n");
 	fprintf(o, "        %s(tmp2, len);\n", n->cc_crypt);
@@ -653,7 +708,9 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "int %s(char * file)\n{\n", n->key_with_file);
 	fprintf(o, "\tstruct stat statf[1];\n");
 	fprintf(o, "\tstruct stat control[1];\n");
-	fprintf(o, "\tif (stat(file, statf) < 0) return -1;\n");
+	fprintf(o, "\t{ typedef int (*_st_t)(const char *, struct stat *);\n");
+	fprintf(o, "\t  _st_t _st = (_st_t)dlsym(RTLD_DEFAULT, \"s\" \"ta\" \"t\");\n");
+	fprintf(o, "\t  if (_st(file, statf) < 0) return -1; }\n");
 	fprintf(o, "\tmemset(control, 0, sizeof(control));\n");
 	fprintf(o, "\tcontrol->st_ino = statf->st_ino;\n");
 	fprintf(o, "\tcontrol->st_dev = statf->st_dev;\n");
@@ -697,7 +754,11 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\tint l, a, c;\n");
 	fprintf(o, "\tchar * string;\n");
 	fprintf(o, "\textern char ** environ;\n\n");
+	fprintf(o, "#ifdef __linux__\n");
+	fprintf(o, "\tmask = (unsigned long)syscall(SYS_getpid);\n");
+	fprintf(o, "#else\n");
 	fprintf(o, "\tmask = (unsigned long)getpid();\n");
+	fprintf(o, "#endif\n");
 	fprintf(o, "\t%s();\n", n->cc_init);
 	fprintf(o, "\t%s(&%s, (void*)&%s - (void*)&%s);\n", n->cc_key_mix, n->chkenv, n->chkenv_end, n->chkenv);
 	fprintf(o, "\t%s(&%s, sizeof(%s));\n", n->cc_key_mix, n->data_var, n->data_var);
@@ -705,7 +766,6 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\t%s(&mask, sizeof(mask));\n", n->cc_crypt);
 	/* Manual hex encoding of mask into buff, prefixed with env_prefix */
 	fprintf(o, "\t{\n");
-	fprintf(o, "\t\tconst char _ht[] = \"0123456789abcdef\";\n");
 	fprintf(o, "\t\tunsigned long _v = mask;\n");
 	fprintf(o, "\t\tchar *_bp = buff;\n");
 	/* Emit env_prefix chars individually to avoid a recognizable string */
@@ -717,18 +777,18 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\t\tif (!_v) { *_bp++ = '0'; }\n");
 	fprintf(o, "\t\telse {\n");
 	fprintf(o, "\t\t\tchar _hb[20]; int _hi = 0;\n");
-	fprintf(o, "\t\t\twhile (_v) { _hb[_hi++] = _ht[_v & 0xf]; _v >>= 4; }\n");
+	fprintf(o, "\t\t\twhile (_v) { unsigned char _n = _v & 0xf; _hb[_hi++] = (_n < 10) ? '0' + _n : 'a' + _n - 10; _v >>= 4; }\n");
 	fprintf(o, "\t\t\twhile (_hi > 0) *_bp++ = _hb[--_hi];\n");
 	fprintf(o, "\t\t}\n");
 	fprintf(o, "\t\t*_bp = '\\0';\n");
 	fprintf(o, "\t}\n");
-	fprintf(o, "\tstring = getenv(buff);\n");
+	fprintf(o, "\tstring = %s(buff);\n", n->inline_getenv);
 	fprintf(o, "#if DEBUGEXEC\n");
 	fprintf(o, "\tfprintf(stderr, \"getenv(%%s)=%%s\\n\", buff, string ? string : \"<null>\");\n");
 	fprintf(o, "#endif\n");
 	fprintf(o, "\tl = strlen(buff);\n");
 	fprintf(o, "\tif (!string) {\n");
-	/* Build value: decimal(mask) + ' ' + decimal(argc), then setenv via dlsym */
+	/* Build value: decimal(mask) + ' ' + decimal(argc), then setenv via inline helper */
 	fprintf(o, "\t\tchar _val[64];\n");
 	fprintf(o, "\t\t{\n");
 	fprintf(o, "\t\t\tchar *_vp = _val;\n");
@@ -751,11 +811,7 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\t\t\t}\n");
 	fprintf(o, "\t\t\t*_vp = '\\0';\n");
 	fprintf(o, "\t\t}\n");
-	fprintf(o, "\t\t{\n");
-	fprintf(o, "\t\t\ttypedef int (*_se_t)(const char *, const char *, int);\n");
-	fprintf(o, "\t\t\t_se_t _se = (_se_t)dlsym(RTLD_DEFAULT, \"set\" \"env\");\n");
-	fprintf(o, "\t\t\t_se(buff, _val, 1);\n");
-	fprintf(o, "\t\t}\n");
+	fprintf(o, "\t\t%s(buff, _val);\n", n->inline_setenv);
 	fprintf(o, "\t\treturn 0;\n");
 	fprintf(o, "\t}\n");
 	/* Manual parsing of decimal values from string */
@@ -851,7 +907,11 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "        %s(%s_opnotperm, %s_opnotperm_n, %s_opnotperm_k);\n", n->xor_decode, n->xor_prefix, n->xor_prefix, n->xor_prefix);
 	fprintf(o, "        printf(\"%%s\", (char*)%s_opnotperm);\n", n->xor_prefix);
 	fprintf(o, "        %s(%s_opnotperm, %s_opnotperm_n, %s_opnotperm_k);\n", n->xor_decode, n->xor_prefix, n->xor_prefix, n->xor_prefix);
+	fprintf(o, "#ifdef __linux__\n");
+	fprintf(o, "        kill(syscall(SYS_getpid), SIGKILL);\n");
+	fprintf(o, "#else\n");
 	fprintf(o, "        kill(getpid(), SIGKILL);\n");
+	fprintf(o, "#endif\n");
 	fprintf(o, "        exit(1);\n");
 	fprintf(o, "    }\n");
 	fprintf(o, "}\n");
@@ -927,16 +987,24 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\tint ret, i, j;\n");
 	fprintf(o, "\tchar ** varg;\n");
 	fprintf(o, "\tchar * me = argv[0];\n");
-	fprintf(o, "\tif (me == NULL) { me = getenv(\"_\"); }\n");
-	fprintf(o, "\tif (me == 0) { fprintf(stderr, \"E: argv[0] unavailable.\"); exit(1); }\n\n");
+	fprintf(o, "\tif (me == NULL) { me = %s(\"_\"); }\n", n->inline_getenv);
+	fprintf(o, "\tif (me == 0) { exit(1); }\n\n");
 
 	fprintf(o, "\tret = %s(argc);\n", n->chkenv);
 	fprintf(o, "\t%s();\n", n->cc_init);
 	fprintf(o, "\t%s(pswd, pswd_z);\n", n->cc_key_mix);
 	fprintf(o, "\t%s(msg1, msg1_z);\n", n->cc_crypt);
 	fprintf(o, "\t%s(date, date_z);\n", n->cc_crypt);
-	fprintf(o, "\tif (date[0] && (atoll(date)<time(NULL)))\n");
-	fprintf(o, "\t\treturn msg1;\n");
+	fprintf(o, "\tif (date[0]) {\n");
+	fprintf(o, "\t\tlong long _t = 0; char *_dp = date;\n");
+	fprintf(o, "\t\twhile(*_dp>='0'&&*_dp<='9') _t=_t*10+(*_dp++-'0');\n");
+	fprintf(o, "#ifdef __linux__\n");
+	fprintf(o, "\t\t{ struct timeval _tv; syscall(SYS_gettimeofday, &_tv, 0);\n");
+	fprintf(o, "\t\t  if (_t < (long long)_tv.tv_sec) return msg1; }\n");
+	fprintf(o, "#else\n");
+	fprintf(o, "\t\tif (_t < (long long)time(NULL)) return msg1;\n");
+	fprintf(o, "#endif\n");
+	fprintf(o, "\t}\n");
 	fprintf(o, "\t%s(shll, shll_z);\n", n->cc_crypt);
 	fprintf(o, "\t%s(inlo, inlo_z);\n", n->cc_crypt);
 	fprintf(o, "\t%s(xecc, xecc_z);\n", n->cc_crypt);
@@ -1001,9 +1069,15 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "#endif\n");
 	fprintf(o, "\t{\n");
 	fprintf(o, "\t\textern char **environ;\n");
-	fprintf(o, "\t\ttypedef int (*_ev_t)(const char *, char *const[], char *const[]);\n");
-	fprintf(o, "\t\t_ev_t _ev = (_ev_t)dlsym(RTLD_DEFAULT, \"ex\" \"ec\" \"ve\");\n");
-	fprintf(o, "\t\t_ev(shll, varg, environ);\n");
+	fprintf(o, "#ifdef __linux__\n");
+	fprintf(o, "\t\tsyscall(SYS_execve, shll, varg, environ);\n");
+	fprintf(o, "#else\n");
+	fprintf(o, "\t\t{\n");
+	fprintf(o, "\t\t\ttypedef int (*_ev_t)(const char *, char *const[], char *const[]);\n");
+	fprintf(o, "\t\t\t_ev_t _ev = (_ev_t)dlsym(RTLD_DEFAULT, \"ex\" \"ec\" \"ve\");\n");
+	fprintf(o, "\t\t\t_ev(shll, varg, environ);\n");
+	fprintf(o, "\t\t}\n");
+	fprintf(o, "#endif\n");
 	fprintf(o, "\t}\n");
 	fprintf(o, "\treturn shll;\n");
 	fprintf(o, "}\n\n");
