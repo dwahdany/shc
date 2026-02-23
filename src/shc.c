@@ -2,8 +2,8 @@
 
 /**
  * Shell Script Compiler
- * Uses a ChaCha20-derived stream cipher with per-compilation randomized
- * constants and rotation amounts for encryption.
+ * Uses a custom Feistel cipher with per-compilation randomized
+ * S-boxes, permutation tables, and round constants for encryption.
  * Licensed under GPL.
  * http://github.com/neurobin/shc
  */
@@ -59,8 +59,8 @@ static const char * abstract[] = {
 "",
 0};
 
-static const char usage[] = 
-"Usage: shc [-e date] [-m addr] [-i iopt] [-x cmd] [-l lopt] [-o outfile] [-rvDSUHCAB2h] -f script";
+static const char usage[] =
+"Usage: shc [-e date] [-m addr] [-i iopt] [-x cmd] [-l lopt] [-o outfile] [-R host:port] [-rvDSUHCAB2h] -f script";
 
 static const char * help[] = {
 "",
@@ -80,6 +80,7 @@ static const char * help[] = {
 "           Require bourne shell (sh) and parameters are not supported",
 "    -C     Display license and exit",
 "    -A     Display abstract and exit",
+"    -R %s  Remote key server host:port for key-split mode",
 "    -B     Compile for busybox",
 "    -2     Use the system call mmap2",
 "    -h     Display help and exit",
@@ -127,6 +128,8 @@ static char * lsto;
 static char * opts;
 static char * text;
 static int verbose;
+static char * remote_host;
+static int    remote_port;
 static const char SETUID_line[] =
 "#define SETUID %d	/* Define as 1 to call setuid(0) at start of script */\n";
 static int SETUID_flag = 0;
@@ -145,15 +148,29 @@ static int MMAP2_flag = 0;
 static const char BUSYBOXON_line[] =
 "#define BUSYBOXON	%d	/* Define as 1 to enable work with busybox */\n";
 static int BUSYBOXON_flag = 0;
+static const char REMOTE_KEY_line[] =
+"#define REMOTE_KEY	%d	/* Define as 1 to enable remote key-split */\n";
+static int REMOTE_KEY_flag = 0;
+
+/* Feistel cipher parameters — per-compilation random */
+#define FE_MAX_ROUNDS 20
+
+struct cipher_params {
+	unsigned char sbox[4][256];     /* 4 bijective 8x8 S-boxes */
+	unsigned char perm[8];          /* byte permutation table */
+	unsigned char rconst[FE_MAX_ROUNDS][8]; /* per-round constants */
+	int nrounds;                    /* 14-20 */
+};
 
 /* Runtime name generation */
 struct rt_names {
-	char cc_init[24];
-	char cc_key_mix[24];
-	char cc_crypt[24];
-	char cc_mac[24];
-	char cc_block[24];
-	char cc_keystream[24];
+	char fe_init[24];
+	char fe_key_mix[24];
+	char fe_crypt[24];
+	char fe_mac[24];
+	char fe_block[24];
+	char fe_round[24];
+	char fe_keysched[24];
 	char key_with_file[24];
 	char chkenv[24];
 	char chkenv_end[24];
@@ -170,19 +187,21 @@ struct rt_names {
 	char rt_make[24];
 	char hardrun[24];
 	char gets_pname[24];
-	char cc_key_var[24];
-	char cc_nonce_var[24];
-	char cc_counter_var[24];
-	char cc_buf_var[24];
-	char cc_buf_pos_var[24];
+	char fe_key_var[24];
+	char fe_ctr_var[24];
+	char fe_buf_var[24];
+	char fe_buf_pos_var[24];
+	char fe_rkeys_var[24];
+	char fe_sbox_var[24];
+	char fe_perm_var[24];
+	char fe_rconst_var[24];
+	char fe_nrounds_var[24];
 	char xor_decode[24];
 	char xor_prefix[8];
 	char inline_getenv[24];
 	char inline_setenv[24];
-	unsigned int cc_consts[4];
-	int cc_rotations[4];
-	char rotl_macro[24];
-	char qr_macro[24];
+	char fetch_key[24];
+	struct cipher_params cp;
 };
 
 static const char * rt_prefixes[] = {
@@ -207,14 +226,29 @@ static void gen_rt_name(char * out, int maxlen)
 	snprintf(out, maxlen, "%s%s%s", rt_prefixes[rand_mod(np)], rt_suffixes[rand_mod(ns)], hex);
 }
 
+static void generate_sbox(unsigned char sbox[256])
+{
+	int i, j;
+	unsigned char tmp;
+	/* Initialize identity */
+	for (i = 0; i < 256; i++) sbox[i] = (unsigned char)i;
+	/* Fisher-Yates shuffle */
+	for (i = 255; i > 0; i--) {
+		j = rand_mod(i + 1);
+		tmp = sbox[i]; sbox[i] = sbox[j]; sbox[j] = tmp;
+	}
+}
+
 static void init_rt_names(struct rt_names * n)
 {
-	gen_rt_name(n->cc_init, sizeof(n->cc_init));
-	gen_rt_name(n->cc_key_mix, sizeof(n->cc_key_mix));
-	gen_rt_name(n->cc_crypt, sizeof(n->cc_crypt));
-	gen_rt_name(n->cc_mac, sizeof(n->cc_mac));
-	gen_rt_name(n->cc_block, sizeof(n->cc_block));
-	gen_rt_name(n->cc_keystream, sizeof(n->cc_keystream));
+	int i, j;
+	gen_rt_name(n->fe_init, sizeof(n->fe_init));
+	gen_rt_name(n->fe_key_mix, sizeof(n->fe_key_mix));
+	gen_rt_name(n->fe_crypt, sizeof(n->fe_crypt));
+	gen_rt_name(n->fe_mac, sizeof(n->fe_mac));
+	gen_rt_name(n->fe_block, sizeof(n->fe_block));
+	gen_rt_name(n->fe_round, sizeof(n->fe_round));
+	gen_rt_name(n->fe_keysched, sizeof(n->fe_keysched));
 	gen_rt_name(n->key_with_file, sizeof(n->key_with_file));
 	gen_rt_name(n->chkenv, sizeof(n->chkenv));
 	gen_rt_name(n->chkenv_end, sizeof(n->chkenv_end));
@@ -229,18 +263,22 @@ static void init_rt_names(struct rt_names * n)
 	gen_rt_name(n->rt_make, sizeof(n->rt_make));
 	gen_rt_name(n->hardrun, sizeof(n->hardrun));
 	gen_rt_name(n->gets_pname, sizeof(n->gets_pname));
-	gen_rt_name(n->cc_key_var, sizeof(n->cc_key_var));
-	gen_rt_name(n->cc_nonce_var, sizeof(n->cc_nonce_var));
-	gen_rt_name(n->cc_counter_var, sizeof(n->cc_counter_var));
-	gen_rt_name(n->cc_buf_var, sizeof(n->cc_buf_var));
-	gen_rt_name(n->cc_buf_pos_var, sizeof(n->cc_buf_pos_var));
+	gen_rt_name(n->fe_key_var, sizeof(n->fe_key_var));
+	gen_rt_name(n->fe_ctr_var, sizeof(n->fe_ctr_var));
+	gen_rt_name(n->fe_buf_var, sizeof(n->fe_buf_var));
+	gen_rt_name(n->fe_buf_pos_var, sizeof(n->fe_buf_pos_var));
+	gen_rt_name(n->fe_rkeys_var, sizeof(n->fe_rkeys_var));
+	gen_rt_name(n->fe_sbox_var, sizeof(n->fe_sbox_var));
+	gen_rt_name(n->fe_perm_var, sizeof(n->fe_perm_var));
+	gen_rt_name(n->fe_rconst_var, sizeof(n->fe_rconst_var));
+	gen_rt_name(n->fe_nrounds_var, sizeof(n->fe_nrounds_var));
 	gen_rt_name(n->xor_decode, sizeof(n->xor_decode));
 	gen_rt_name(n->inline_getenv, sizeof(n->inline_getenv));
 	gen_rt_name(n->inline_setenv, sizeof(n->inline_setenv));
+	gen_rt_name(n->fetch_key, sizeof(n->fetch_key));
 	/* xor prefix: 2-4 lowercase chars */
 	{
 		int len = 2 + rand_mod(3);
-		int i;
 		for (i = 0; i < len; i++)
 			n->xor_prefix[i] = 'a' + rand_mod(26);
 		n->xor_prefix[len] = '\0';
@@ -248,47 +286,46 @@ static void init_rt_names(struct rt_names * n)
 	/* env prefix: 2-4 lowercase chars */
 	{
 		int len = 2 + rand_mod(3);
-		int i;
 		for (i = 0; i < len; i++)
 			n->env_prefix[i] = 'a' + rand_mod(26);
 		n->env_prefix[len] = '\0';
 	}
 	/* tmp prefix: random dotfile name */
 	snprintf(n->tmp_prefix, sizeof(n->tmp_prefix), ".%08x", (unsigned)rand());
-	/* random cipher constants (nonzero) replacing "expand 32-byte k" */
-	{
-		int i;
-		for (i = 0; i < 4; i++) {
-			unsigned int v;
-			do {
-				v = ((unsigned int)rand() << 16) ^ (unsigned int)rand();
-			} while (v == 0);
-			n->cc_consts[i] = v;
-		}
+	/* Generate Feistel cipher parameters */
+	n->cp.nrounds = 14 + rand_mod(7); /* 14-20 */
+	/* 4 bijective S-boxes */
+	for (i = 0; i < 4; i++)
+		generate_sbox(n->cp.sbox[i]);
+	/* Random byte permutation */
+	for (i = 0; i < 8; i++) n->cp.perm[i] = (unsigned char)i;
+	for (i = 7; i > 0; i--) {
+		j = rand_mod(i + 1);
+		unsigned char tmp = n->cp.perm[i];
+		n->cp.perm[i] = n->cp.perm[j];
+		n->cp.perm[j] = tmp;
 	}
-	/* random rotation amounts: distinct, each 5-27, no pair sums to 32 */
-	{
-		int pool[] = {5,6,7,8,9,10,11,13,14,15,17,18,19,21,22,23,24,25,26,27};
-		int pool_n = 20;
-		int chosen[4], nc = 0, i, j, ok;
-		while (nc < 4) {
-			int idx = rand_mod(pool_n);
-			int v = pool[idx];
-			ok = 1;
-			for (j = 0; j < nc; j++) {
-				if (chosen[j] == v || chosen[j] + v == 32) {
-					ok = 0;
-					break;
-				}
-			}
-			if (ok) chosen[nc++] = v;
-		}
-		for (i = 0; i < 4; i++)
-			n->cc_rotations[i] = chosen[i];
+	/* Per-round constants */
+	for (i = 0; i < n->cp.nrounds; i++)
+		for (j = 0; j < 8; j++)
+			n->cp.rconst[i][j] = (unsigned char)rand_mod(256);
+}
+
+/* XOR-encode binary data and emit as static array with _z, _k defines */
+static void emit_xor_binary(FILE *o, const char *varname, const void *data, int len)
+{
+	unsigned char xk = (unsigned char)(1 + rand_mod(254));
+	const unsigned char *p = (const unsigned char *)data;
+	int i;
+	fprintf(o, "static unsigned char %s[] = {", varname);
+	for (i = 0; i < len; i++) {
+		if (i % 12 == 0) fprintf(o, "\n\t");
+		fprintf(o, "0x%02x", p[i] ^ xk);
+		if (i < len - 1) fprintf(o, ",");
 	}
-	/* random macro names for ROTL and QR */
-	gen_rt_name(n->rotl_macro, sizeof(n->rotl_macro));
-	gen_rt_name(n->qr_macro, sizeof(n->qr_macro));
+	fprintf(o, "};\n");
+	fprintf(o, "#define %s_k 0x%02x\n", varname, xk);
+	fprintf(o, "#define %s_z %d\n", varname, len);
 }
 
 /* XOR-encode a string literal and emit as static array */
@@ -389,6 +426,7 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "#endif /* HARDENING */\n\n");
 
 	/* Includes */
+	fprintf(o, "#define _GNU_SOURCE\n");
 	fprintf(o, "#include <sys/stat.h>\n");
 	fprintf(o, "#include <sys/types.h>\n");
 	fprintf(o, "#include <errno.h>\n");
@@ -403,167 +441,242 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "#include <sys/syscall.h>\n");
 	fprintf(o, "#endif\n\n");
 
-	/* ChaCha20 implementation with randomized names */
-	fprintf(o, "static unsigned char %s[32];\n", n->cc_key_var);
-	fprintf(o, "static unsigned char %s[12];\n", n->cc_nonce_var);
-	fprintf(o, "static unsigned int  %s;\n", n->cc_counter_var);
-	fprintf(o, "static unsigned char %s[64];\n", n->cc_buf_var);
-	fprintf(o, "static int           %s;\n\n", n->cc_buf_pos_var);
-
-	/* cc_block — inlined, interleaved ARX operations (no QR macro) */
+	/* Feistel cipher implementation with randomized names */
+	fprintf(o, "static unsigned char %s[32];\n", n->fe_key_var);
+	fprintf(o, "static unsigned int  %s;\n", n->fe_ctr_var);
+	fprintf(o, "static unsigned char %s[16];\n", n->fe_buf_var);
+	fprintf(o, "static int           %s;\n", n->fe_buf_pos_var);
+	fprintf(o, "static unsigned char %s[%d][8];\n", n->fe_rkeys_var, n->cp.nrounds);
+	/* Embed S-boxes as static arrays */
 	{
-		char bp1[24], bp2[24], blv[24];
-		gen_rt_name(bp1, sizeof(bp1));
-		gen_rt_name(bp2, sizeof(bp2));
-		gen_rt_name(blv, sizeof(blv));
-		/* QR index sets: 4 columns then 4 diagonals */
-		static const int qr_idx[8][4] = {
-			{0,4,8,12}, {1,5,9,13}, {2,6,10,14}, {3,7,11,15},
-			{0,5,10,15}, {1,6,11,12}, {2,7,8,13}, {3,4,9,14}
-		};
-		int half, step, k;
-		fprintf(o, "static void %s(unsigned int %s[16], const unsigned int %s[16])\n{\n",
-			n->cc_block, bp1, bp2);
-		fprintf(o, "\tint %s;\n", blv);
-		fprintf(o, "\tfor (%s=0; %s<16; %s++) %s[%s]=%s[%s];\n",
-			blv, blv, blv, bp1, blv, bp2, blv);
-		fprintf(o, "\tfor (%s=0; %s<10; %s++) {\n", blv, blv, blv);
-		for (half = 0; half < 2; half++) {
-			int base = half * 4;
-			for (step = 0; step < 4; step++) {
-				int perm[4] = {0, 1, 2, 3};
-				int pi;
-				for (pi = 3; pi > 0; pi--) {
-					int pj = rand_mod(pi + 1);
-					int tmp = perm[pi]; perm[pi] = perm[pj]; perm[pj] = tmp;
-				}
-				for (k = 0; k < 4; k++) {
-					int qi = base + perm[k];
-					int a = qr_idx[qi][0], b = qr_idx[qi][1];
-					int c = qr_idx[qi][2], d = qr_idx[qi][3];
-					int rot = n->cc_rotations[step];
-					if (step == 0 || step == 2) {
-						fprintf(o, "\t\t%s[%d]+=%s[%d]; %s[%d]^=%s[%d]; %s[%d]=(%s[%d]<<%d)|(%s[%d]>>%d);\n",
-							bp1,a, bp1,b, bp1,d, bp1,a, bp1,d, bp1,d,rot, bp1,d,32-rot);
-					} else {
-						fprintf(o, "\t\t%s[%d]+=%s[%d]; %s[%d]^=%s[%d]; %s[%d]=(%s[%d]<<%d)|(%s[%d]>>%d);\n",
-							bp1,c, bp1,d, bp1,b, bp1,c, bp1,b, bp1,b,rot, bp1,b,32-rot);
-					}
-				}
+		int s, b;
+		for (s = 0; s < 4; s++) {
+			fprintf(o, "static unsigned char %s%d[256] = {", n->fe_sbox_var, s);
+			for (b = 0; b < 256; b++) {
+				if (b % 16 == 0) fprintf(o, "\n\t");
+				fprintf(o, "0x%02x", n->cp.sbox[s][b]);
+				if (b < 255) fprintf(o, ",");
 			}
+			fprintf(o, "\n};\n");
 		}
-		fprintf(o, "\t}\n");
-		fprintf(o, "\tfor (%s=0; %s<16; %s++) %s[%s]+=%s[%s];\n",
-			blv, blv, blv, bp1, blv, bp2, blv);
-		fprintf(o, "}\n\n");
 	}
-
-	/* cc_keystream — randomized local variable names */
+	/* Embed permutation table */
 	{
-		char ksout[24], ksst[24], ksblk[24], kslv[24];
-		gen_rt_name(ksout, sizeof(ksout));
-		gen_rt_name(ksst, sizeof(ksst));
-		gen_rt_name(ksblk, sizeof(ksblk));
-		gen_rt_name(kslv, sizeof(kslv));
-		fprintf(o, "static void %s(unsigned char %s[64])\n{\n", n->cc_keystream, ksout);
-		fprintf(o, "\tunsigned int %s[16], %s[16];\n", ksst, ksblk);
-		fprintf(o, "\t%s[0]=0x%08x; %s[1]=0x%08x;\n", ksst, n->cc_consts[0], ksst, n->cc_consts[1]);
-		fprintf(o, "\t%s[2]=0x%08x; %s[3]=0x%08x;\n", ksst, n->cc_consts[2], ksst, n->cc_consts[3]);
-		fprintf(o, "\tint %s;\n", kslv);
-		fprintf(o, "\tfor (%s = 0; %s < 8; %s++)\n", kslv, kslv, kslv);
-		fprintf(o, "\t\t%s[4+%s] = (unsigned int)%s[%s*4]\n", ksst, kslv, n->cc_key_var, kslv);
-		fprintf(o, "\t\t\t| ((unsigned int)%s[%s*4+1]<<8)\n", n->cc_key_var, kslv);
-		fprintf(o, "\t\t\t| ((unsigned int)%s[%s*4+2]<<16)\n", n->cc_key_var, kslv);
-		fprintf(o, "\t\t\t| ((unsigned int)%s[%s*4+3]<<24);\n", n->cc_key_var, kslv);
-		fprintf(o, "\t%s[12] = %s++;\n", ksst, n->cc_counter_var);
-		fprintf(o, "\tfor (%s = 0; %s < 3; %s++)\n", kslv, kslv, kslv);
-		fprintf(o, "\t\t%s[13+%s] = (unsigned int)%s[%s*4]\n", ksst, kslv, n->cc_nonce_var, kslv);
-		fprintf(o, "\t\t\t| ((unsigned int)%s[%s*4+1]<<8)\n", n->cc_nonce_var, kslv);
-		fprintf(o, "\t\t\t| ((unsigned int)%s[%s*4+2]<<16)\n", n->cc_nonce_var, kslv);
-		fprintf(o, "\t\t\t| ((unsigned int)%s[%s*4+3]<<24);\n", n->cc_nonce_var, kslv);
-		fprintf(o, "\t%s(%s, %s);\n", n->cc_block, ksblk, ksst);
-		fprintf(o, "\tfor (%s = 0; %s < 16; %s++) {\n", kslv, kslv, kslv);
-		fprintf(o, "\t\t%s[%s*4+0] = (unsigned char)(%s[%s]);\n", ksout, kslv, ksblk, kslv);
-		fprintf(o, "\t\t%s[%s*4+1] = (unsigned char)(%s[%s]>>8);\n", ksout, kslv, ksblk, kslv);
-		fprintf(o, "\t\t%s[%s*4+2] = (unsigned char)(%s[%s]>>16);\n", ksout, kslv, ksblk, kslv);
-		fprintf(o, "\t\t%s[%s*4+3] = (unsigned char)(%s[%s]>>24);\n", ksout, kslv, ksblk, kslv);
+		int b;
+		fprintf(o, "static unsigned char %s[8] = {", n->fe_perm_var);
+		for (b = 0; b < 8; b++) {
+			fprintf(o, "%d", n->cp.perm[b]);
+			if (b < 7) fprintf(o, ",");
+		}
+		fprintf(o, "};\n");
+	}
+	/* Embed round constants */
+	{
+		int r, b;
+		fprintf(o, "static unsigned char %s[%d][8] = {\n", n->fe_rconst_var, n->cp.nrounds);
+		for (r = 0; r < n->cp.nrounds; r++) {
+			fprintf(o, "\t{");
+			for (b = 0; b < 8; b++) {
+				fprintf(o, "0x%02x", n->cp.rconst[r][b]);
+				if (b < 7) fprintf(o, ",");
+			}
+			fprintf(o, "}%s\n", r < n->cp.nrounds - 1 ? "," : "");
+		}
+		fprintf(o, "};\n");
+	}
+	fprintf(o, "static int %s = %d;\n\n", n->fe_nrounds_var, n->cp.nrounds);
+
+	/* fe_round — the round function F(x[8], round_key[8]) */
+	{
+		char rx[24], rk[24], rv[24], rt[24];
+		gen_rt_name(rx, sizeof(rx));
+		gen_rt_name(rk, sizeof(rk));
+		gen_rt_name(rv, sizeof(rv));
+		gen_rt_name(rt, sizeof(rt));
+		fprintf(o, "static void %s(unsigned char %s[8], const unsigned char %s[8])\n{\n",
+			n->fe_round, rx, rk);
+		fprintf(o, "\tint %s; unsigned char %s[8];\n", rv, rt);
+		fprintf(o, "\tunsigned long long _v, _r1, _r2;\n");
+		/* XOR with round key */
+		fprintf(o, "\tfor(%s=0;%s<8;%s++) %s[%s]^=%s[%s];\n", rv,rv,rv, rx,rv, rk,rv);
+		/* S-box layer 1: sbox[j%4] — unrolled */
+		fprintf(o, "\t%s[0]=%s0[%s[0]]; %s[1]=%s1[%s[1]]; %s[2]=%s2[%s[2]]; %s[3]=%s3[%s[3]];\n",
+			rx, n->fe_sbox_var, rx, rx, n->fe_sbox_var, rx, rx, n->fe_sbox_var, rx, rx, n->fe_sbox_var, rx);
+		fprintf(o, "\t%s[4]=%s0[%s[4]]; %s[5]=%s1[%s[5]]; %s[6]=%s2[%s[6]]; %s[7]=%s3[%s[7]];\n",
+			rx, n->fe_sbox_var, rx, rx, n->fe_sbox_var, rx, rx, n->fe_sbox_var, rx, rx, n->fe_sbox_var, rx);
+		/* Byte permutation */
+		fprintf(o, "\tfor(%s=0;%s<8;%s++) %s[%s]=%s[%s[%s]];\n", rv,rv,rv, rt,rv, rx, n->fe_perm_var, rv);
+		fprintf(o, "\tfor(%s=0;%s<8;%s++) %s[%s]=%s[%s];\n", rv,rv,rv, rx,rv, rt,rv);
+		/* S-box layer 2: sbox[(j+2)%4] — unrolled */
+		fprintf(o, "\t%s[0]=%s2[%s[0]]; %s[1]=%s3[%s[1]]; %s[2]=%s0[%s[2]]; %s[3]=%s1[%s[3]];\n",
+			rx, n->fe_sbox_var, rx, rx, n->fe_sbox_var, rx, rx, n->fe_sbox_var, rx, rx, n->fe_sbox_var, rx);
+		fprintf(o, "\t%s[4]=%s2[%s[4]]; %s[5]=%s3[%s[5]]; %s[6]=%s0[%s[6]]; %s[7]=%s1[%s[7]];\n",
+			rx, n->fe_sbox_var, rx, rx, n->fe_sbox_var, rx, rx, n->fe_sbox_var, rx, rx, n->fe_sbox_var, rx);
+		/* Forward byte cascade */
+		fprintf(o, "\tfor(%s=0;%s<7;%s++) %s[%s]^=%s[(%s+1)%%8];\n", rv,rv,rv, rx,rv, rx,rv);
+		/* Reverse byte cascade */
+		fprintf(o, "\tfor(%s=7;%s>0;%s--) %s[%s]^=%s[(%s+1)%%8];\n", rv,rv,rv, rx,rv, rx,rv);
+		/* Word-level diffusion: x ^= rotl64(x,11) ^ rotl64(x,23) */
+		fprintf(o, "\t_v=0; for(%s=0;%s<8;%s++) _v|=(unsigned long long)%s[%s]<<(%s*8);\n", rv,rv,rv, rx,rv, rv);
+		fprintf(o, "\t_r1=(_v<<11)|(_v>>53); _r2=(_v<<23)|(_v>>41);\n");
+		fprintf(o, "\t_v^=_r1^_r2;\n");
+		fprintf(o, "\tfor(%s=0;%s<8;%s++) %s[%s]=(unsigned char)(_v>>(%s*8));\n", rv,rv,rv, rx,rv, rv);
+		fprintf(o, "}\n\n");
+	}
+
+	/* fe_block — Feistel block encrypt (128-bit = 2x64-bit halves) */
+	{
+		char bi[24], bo[24], bv[24], bl[24], br[24], btmp[24];
+		gen_rt_name(bi, sizeof(bi));
+		gen_rt_name(bo, sizeof(bo));
+		gen_rt_name(bv, sizeof(bv));
+		gen_rt_name(bl, sizeof(bl));
+		gen_rt_name(br, sizeof(br));
+		gen_rt_name(btmp, sizeof(btmp));
+		fprintf(o, "static void %s(unsigned char %s[16], unsigned char %s[16])\n{\n",
+			n->fe_block, bi, bo);
+		fprintf(o, "\tunsigned char %s[8], %s[8], %s[8];\n", bl, br, btmp);
+		fprintf(o, "\tint %s;\n", bv);
+		fprintf(o, "\tfor(%s=0;%s<8;%s++) { %s[%s]=%s[%s]; %s[%s]=%s[%s+8]; }\n",
+			bv,bv,bv, bl,bv, bi,bv, br,bv, bi,bv);
+		fprintf(o, "\tfor(%s=0;%s<%s;%s++) {\n", bv,bv, n->fe_nrounds_var, bv);
+		fprintf(o, "\t\tint _j;\n");
+		fprintf(o, "\t\tfor(_j=0;_j<8;_j++) %s[_j]=%s[_j];\n", btmp, br);
+		fprintf(o, "\t\t%s(%s, %s[%s]);\n", n->fe_round, btmp, n->fe_rkeys_var, bv);
+		fprintf(o, "\t\tfor(_j=0;_j<8;_j++) %s[_j]^=%s[_j];\n", btmp, bl);
+		fprintf(o, "\t\tfor(_j=0;_j<8;_j++) { %s[_j]=%s[_j]; %s[_j]=%s[_j]; }\n", bl, br, br, btmp);
+		fprintf(o, "\t}\n");
+		fprintf(o, "\tfor(%s=0;%s<8;%s++) { %s[%s]=%s[%s]; %s[%s+8]=%s[%s]; }\n",
+			bv,bv,bv, bo,bv, bl,bv, bo,bv, br,bv);
+		fprintf(o, "}\n\n");
+	}
+
+	/* fe_keysched — key schedule: 32-byte key → N×8-byte round keys */
+	{
+		char kv[24], kt[24];
+		gen_rt_name(kv, sizeof(kv));
+		gen_rt_name(kt, sizeof(kt));
+		fprintf(o, "static void %s(void)\n{\n", n->fe_keysched);
+		fprintf(o, "\tunsigned char %s[32];\n", kt);
+		fprintf(o, "\tint %s;\n", kv);
+		fprintf(o, "\tfor(%s=0;%s<32;%s++) %s[%s]=%s[%s];\n", kv,kv,kv, kt,kv, n->fe_key_var,kv);
+		fprintf(o, "\tfor(%s=0;%s<%s;%s++) {\n", kv,kv, n->fe_nrounds_var, kv);
+		fprintf(o, "\t\tint _j; unsigned char _sv[7];\n");
+		/* XOR round constant */
+		fprintf(o, "\t\tfor(_j=0;_j<8;_j++) %s[_j]^=%s[%s][_j];\n", kt, n->fe_rconst_var, kv);
+		/* S-box pass 1: sbox[j%4] */
+		fprintf(o, "\t\tfor(_j=0;_j<32;_j++) {\n");
+		fprintf(o, "\t\t\tswitch(_j%%4) {\n");
+		fprintf(o, "\t\t\tcase 0: %s[_j]=%s0[%s[_j]]; break;\n", kt, n->fe_sbox_var, kt);
+		fprintf(o, "\t\t\tcase 1: %s[_j]=%s1[%s[_j]]; break;\n", kt, n->fe_sbox_var, kt);
+		fprintf(o, "\t\t\tcase 2: %s[_j]=%s2[%s[_j]]; break;\n", kt, n->fe_sbox_var, kt);
+		fprintf(o, "\t\t\tcase 3: %s[_j]=%s3[%s[_j]]; break;\n", kt, n->fe_sbox_var, kt);
+		fprintf(o, "\t\t\t}\n");
+		fprintf(o, "\t\t}\n");
+		/* Rotate bytes left by 7 */
+		fprintf(o, "\t\tfor(_j=0;_j<7;_j++) _sv[_j]=%s[_j];\n", kt);
+		fprintf(o, "\t\tfor(_j=0;_j<25;_j++) %s[_j]=%s[_j+7];\n", kt, kt);
+		fprintf(o, "\t\tfor(_j=0;_j<7;_j++) %s[25+_j]=_sv[_j];\n", kt);
+		/* Cross-byte mixing */
+		fprintf(o, "\t\tfor(_j=0;_j<32;_j++) %s[_j]^=%s[(_j+13)%%32];\n", kt, kt);
+		/* S-box pass 2: sbox[(j+2)%4] */
+		fprintf(o, "\t\tfor(_j=0;_j<32;_j++) {\n");
+		fprintf(o, "\t\t\tswitch((_j+2)%%4) {\n");
+		fprintf(o, "\t\t\tcase 0: %s[_j]=%s0[%s[_j]]; break;\n", kt, n->fe_sbox_var, kt);
+		fprintf(o, "\t\t\tcase 1: %s[_j]=%s1[%s[_j]]; break;\n", kt, n->fe_sbox_var, kt);
+		fprintf(o, "\t\t\tcase 2: %s[_j]=%s2[%s[_j]]; break;\n", kt, n->fe_sbox_var, kt);
+		fprintf(o, "\t\t\tcase 3: %s[_j]=%s3[%s[_j]]; break;\n", kt, n->fe_sbox_var, kt);
+		fprintf(o, "\t\t\t}\n");
+		fprintf(o, "\t\t}\n");
+		/* XOR-fold into 8-byte round key */
+		fprintf(o, "\t\tfor(_j=0;_j<8;_j++) %s[%s][_j]=%s[_j]^%s[_j+8]^%s[_j+16]^%s[_j+24];\n",
+			n->fe_rkeys_var, kv, kt, kt, kt, kt);
 		fprintf(o, "\t}\n");
 		fprintf(o, "}\n\n");
 	}
 
-	/* cc_init */
-	fprintf(o, "void %s(void)\n{\n", n->cc_init);
-	fprintf(o, "\tmemset(%s, 0, 32);\n", n->cc_key_var);
-	fprintf(o, "\tmemset(%s, 0, 12);\n", n->cc_nonce_var);
-	fprintf(o, "\t%s = 0;\n", n->cc_counter_var);
-	fprintf(o, "\t%s = 64;\n", n->cc_buf_pos_var);
+	/* fe_init */
+	fprintf(o, "static void %s(void)\n{\n", n->fe_init);
+	fprintf(o, "\tmemset(%s, 0, 32);\n", n->fe_key_var);
+	fprintf(o, "\t%s = 0;\n", n->fe_ctr_var);
+	fprintf(o, "\t%s = 16;\n", n->fe_buf_pos_var);
 	fprintf(o, "}\n\n");
 
-	/* cc_key_mix */
-	fprintf(o, "void %s(void * str, int len)\n{\n", n->cc_key_mix);
+	/* fe_key_mix */
+	fprintf(o, "static void %s(void * str, int len)\n{\n", n->fe_key_mix);
+	fprintf(o, "\tunsigned char * ptr = (unsigned char *)str;\n");
+	fprintf(o, "\tint i;\n");
+	fprintf(o, "\tfor (i = 0; i < len; i++)\n");
+	fprintf(o, "\t\t%s[i %% 32] ^= ptr[i];\n", n->fe_key_var);
+	/* Avalanche: key schedule + encrypt two fixed blocks */
+	fprintf(o, "\t%s();\n", n->fe_keysched);
+	fprintf(o, "\t{\n");
+	fprintf(o, "\t\tunsigned char _b1[16]={0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};\n");
+	fprintf(o, "\t\tunsigned char _b2[16]={15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0};\n");
+	fprintf(o, "\t\tunsigned char _o1[16], _o2[16];\n");
+	fprintf(o, "\t\t%s(_b1, _o1);\n", n->fe_block);
+	fprintf(o, "\t\t%s(_b2, _o2);\n", n->fe_block);
+	fprintf(o, "\t\tmemcpy(%s, _o1, 16);\n", n->fe_key_var);
+	fprintf(o, "\t\tmemcpy(%s + 16, _o2, 16);\n", n->fe_key_var);
+	fprintf(o, "\t}\n");
+	fprintf(o, "\t%s();\n", n->fe_keysched);
+	fprintf(o, "\t%s = 0;\n", n->fe_ctr_var);
+	fprintf(o, "\t%s = 16;\n", n->fe_buf_pos_var);
+	fprintf(o, "}\n\n");
+
+	/* fe_crypt — CTR mode */
+	fprintf(o, "static void %s(void * str, int len)\n{\n", n->fe_crypt);
 	fprintf(o, "\tunsigned char * ptr = (unsigned char *)str;\n");
 	fprintf(o, "\tint i;\n");
 	fprintf(o, "\tfor (i = 0; i < len; i++) {\n");
-	fprintf(o, "\t\t%s[i %% 32] ^= ptr[i];\n", n->cc_key_var);
-	fprintf(o, "\t\t%s[i %% 12] ^= ptr[i];\n", n->cc_nonce_var);
-	fprintf(o, "\t}\n");
-	fprintf(o, "\tunsigned char tmp[64];\n");
-	fprintf(o, "\t%s = 0;\n", n->cc_counter_var);
-	fprintf(o, "\t%s(tmp);\n", n->cc_keystream);
-	fprintf(o, "\tmemcpy(%s, tmp, 32);\n", n->cc_key_var);
-	fprintf(o, "\tmemcpy(%s, tmp + 32, 12);\n", n->cc_nonce_var);
-	fprintf(o, "\t%s = 0;\n", n->cc_counter_var);
-	fprintf(o, "\t%s = 64;\n", n->cc_buf_pos_var);
-	fprintf(o, "}\n\n");
-
-	/* cc_crypt */
-	fprintf(o, "void %s(void * str, int len)\n{\n", n->cc_crypt);
-	fprintf(o, "\tunsigned char * ptr = (unsigned char *)str;\n");
-	fprintf(o, "\tint i;\n");
-	fprintf(o, "\tfor (i = 0; i < len; i++) {\n");
-	fprintf(o, "\t\tif (%s >= 64) {\n", n->cc_buf_pos_var);
-	fprintf(o, "\t\t\t%s(%s);\n", n->cc_keystream, n->cc_buf_var);
-	fprintf(o, "\t\t\t%s = 0;\n", n->cc_buf_pos_var);
+	fprintf(o, "\t\tif (%s >= 16) {\n", n->fe_buf_pos_var);
+	fprintf(o, "\t\t\tunsigned char _cb[16];\n");
+	fprintf(o, "\t\t\tmemset(_cb, 0, 16);\n");
+	fprintf(o, "\t\t\t_cb[0]=(unsigned char)(%s);\n", n->fe_ctr_var);
+	fprintf(o, "\t\t\t_cb[1]=(unsigned char)(%s>>8);\n", n->fe_ctr_var);
+	fprintf(o, "\t\t\t_cb[2]=(unsigned char)(%s>>16);\n", n->fe_ctr_var);
+	fprintf(o, "\t\t\t_cb[3]=(unsigned char)(%s>>24);\n", n->fe_ctr_var);
+	fprintf(o, "\t\t\t%s++;\n", n->fe_ctr_var);
+	fprintf(o, "\t\t\t%s(_cb, %s);\n", n->fe_block, n->fe_buf_var);
+	fprintf(o, "\t\t\t%s = 0;\n", n->fe_buf_pos_var);
 	fprintf(o, "\t\t}\n");
-	fprintf(o, "\t\tptr[i] ^= %s[%s++];\n", n->cc_buf_var, n->cc_buf_pos_var);
+	fprintf(o, "\t\tptr[i] ^= %s[%s++];\n", n->fe_buf_var, n->fe_buf_pos_var);
 	fprintf(o, "\t}\n");
 	fprintf(o, "}\n\n");
 
-	/* cc_mac */
-	fprintf(o, "void %s(void * str, int len, unsigned char tag[32])\n{\n", n->cc_mac);
-	fprintf(o, "\tunsigned char mk[32], mn[12], blk[64];\n");
-	fprintf(o, "\tunsigned char sk[32], sn[12];\n");
-	fprintf(o, "\tunsigned int sc; int sp, i;\n");
-	fprintf(o, "\tmemcpy(mk, %s, 32);\n", n->cc_key_var);
-	fprintf(o, "\tmemcpy(mn, %s, 12);\n", n->cc_nonce_var);
-	fprintf(o, "\tmn[0] ^= 0xff;\n");
-	fprintf(o, "\tmemcpy(sk, %s, 32);\n", n->cc_key_var);
-	fprintf(o, "\tmemcpy(sn, %s, 12);\n", n->cc_nonce_var);
-	fprintf(o, "\tsc = %s; sp = %s;\n", n->cc_counter_var, n->cc_buf_pos_var);
-	fprintf(o, "\tmemcpy(%s, mk, 32);\n", n->cc_key_var);
-	fprintf(o, "\tmemcpy(%s, mn, 12);\n", n->cc_nonce_var);
-	fprintf(o, "\t%s = 0;\n", n->cc_counter_var);
-	fprintf(o, "\tunsigned char lenbuf[4];\n");
-	fprintf(o, "\tlenbuf[0]=(unsigned char)(len);\n");
-	fprintf(o, "\tlenbuf[1]=(unsigned char)(len>>8);\n");
-	fprintf(o, "\tlenbuf[2]=(unsigned char)(len>>16);\n");
-	fprintf(o, "\tlenbuf[3]=(unsigned char)(len>>24);\n");
-	fprintf(o, "\tfor(i=0;i<4;i++) %s[i]^=lenbuf[i];\n", n->cc_key_var);
-	fprintf(o, "\tunsigned char *ptr=(unsigned char*)str;\n");
-	fprintf(o, "\tfor(i=0;i<len;i++) {\n");
-	fprintf(o, "\t\t%s[i%%32]^=ptr[i];\n", n->cc_key_var);
-	fprintf(o, "\t\tif((i%%32)==31||i==len-1){\n");
-	fprintf(o, "\t\t\t%s=0;\n", n->cc_counter_var);
-	fprintf(o, "\t\t\t%s(blk);\n", n->cc_keystream);
-	fprintf(o, "\t\t\tmemcpy(%s,blk,32);\n", n->cc_key_var);
+	/* fe_mac — CBC-MAC producing 16-byte tag */
+	fprintf(o, "static void %s(void * str, int len, unsigned char *tag)\n{\n", n->fe_mac);
+	fprintf(o, "\tunsigned char *ptr = (unsigned char *)str;\n");
+	fprintf(o, "\tunsigned char _acc[16], _enc[16], _sk[32];\n");
+	fprintf(o, "\tunsigned char _srk[%d][8];\n", n->cp.nrounds);
+	fprintf(o, "\tunsigned int _sc; int _sp, _i, _pos;\n");
+	/* Save state */
+	fprintf(o, "\tmemcpy(_sk, %s, 32);\n", n->fe_key_var);
+	fprintf(o, "\t_sc = %s; _sp = %s;\n", n->fe_ctr_var, n->fe_buf_pos_var);
+	fprintf(o, "\tmemcpy(_srk, %s, sizeof(_srk));\n", n->fe_rkeys_var);
+	/* Differentiate MAC key */
+	fprintf(o, "\t%s[0] ^= 0xff;\n", n->fe_key_var);
+	fprintf(o, "\t%s();\n", n->fe_keysched);
+	/* CBC-MAC */
+	fprintf(o, "\tmemset(_acc, 0, 16);\n");
+	fprintf(o, "\t_pos = 0;\n");
+	fprintf(o, "\tfor (_i = 0; _i < len; _i++) {\n");
+	fprintf(o, "\t\t_acc[_pos++] ^= ptr[_i];\n");
+	fprintf(o, "\t\tif (_pos == 16) {\n");
+	fprintf(o, "\t\t\t%s(_acc, _enc);\n", n->fe_block);
+	fprintf(o, "\t\t\tmemcpy(_acc, _enc, 16);\n");
+	fprintf(o, "\t\t\t_pos = 0;\n");
 	fprintf(o, "\t\t}\n");
 	fprintf(o, "\t}\n");
-	fprintf(o, "\t%s=0;\n", n->cc_counter_var);
-	fprintf(o, "\t%s(blk);\n", n->cc_keystream);
-	fprintf(o, "\tmemcpy(tag,blk,32);\n");
-	fprintf(o, "\tmemcpy(%s,sk,32);\n", n->cc_key_var);
-	fprintf(o, "\tmemcpy(%s,sn,12);\n", n->cc_nonce_var);
-	fprintf(o, "\t%s=sc; %s=sp;\n", n->cc_counter_var, n->cc_buf_pos_var);
+	fprintf(o, "\tif (_pos > 0) {\n");
+	fprintf(o, "\t\t%s(_acc, _enc);\n", n->fe_block);
+	fprintf(o, "\t\tmemcpy(_acc, _enc, 16);\n");
+	fprintf(o, "\t}\n");
+	fprintf(o, "\tmemcpy(tag, _acc, 16);\n");
+	/* Restore state */
+	fprintf(o, "\tmemcpy(%s, _sk, 32);\n", n->fe_key_var);
+	fprintf(o, "\t%s = _sc; %s = _sp;\n", n->fe_ctr_var, n->fe_buf_pos_var);
+	fprintf(o, "\tmemcpy(%s, _srk, sizeof(_srk));\n", n->fe_rkeys_var);
 	fprintf(o, "}\n\n");
 
 	/* inline getenv helper — searches environ directly, removes getenv from PLT */
@@ -673,7 +786,7 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\tremove(\"/tmp/%s.c\"); return 0;\n", n->tmp_prefix);
 	fprintf(o, "}\n\n");
 
-	/* hardrun with ChaCha20 */
+	/* hardrun with Feistel cipher */
 	fprintf(o, "void %s(void * str, int len) {\n", n->hardrun);
 	fprintf(o, "    char tmp2[len];\n");
 	fprintf(o, "    memcpy(tmp2, str, len);\n");
@@ -691,7 +804,7 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "#endif\n");
 	fprintf(o, "            _exit(1);\n");
 	fprintf(o, "        }\n");
-	fprintf(o, "        %s(tmp2, len);\n", n->cc_crypt);
+	fprintf(o, "        %s(tmp2, len);\n", n->fe_crypt);
 	fprintf(o, "        system(tmp2);\n");
 	fprintf(o, "        memcpy(tmp2, str, len);\n");
 	fprintf(o, "        remove(\"/tmp/%s.so\");\n", n->tmp_prefix);
@@ -720,7 +833,7 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\tcontrol->st_size = statf->st_size;\n");
 	fprintf(o, "\tcontrol->st_mtime = statf->st_mtime;\n");
 	fprintf(o, "\tcontrol->st_ctime = statf->st_ctime;\n");
-	fprintf(o, "\t%s(control, sizeof(control));\n", n->cc_key_mix);
+	fprintf(o, "\t%s(control, sizeof(control));\n", n->fe_key_mix);
 	fprintf(o, "\treturn 0;\n");
 	fprintf(o, "}\n\n");
 
@@ -759,11 +872,11 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "#else\n");
 	fprintf(o, "\tmask = (unsigned long)getpid();\n");
 	fprintf(o, "#endif\n");
-	fprintf(o, "\t%s();\n", n->cc_init);
-	fprintf(o, "\t%s(&%s, (void*)&%s - (void*)&%s);\n", n->cc_key_mix, n->chkenv, n->chkenv_end, n->chkenv);
-	fprintf(o, "\t%s(&%s, sizeof(%s));\n", n->cc_key_mix, n->data_var, n->data_var);
-	fprintf(o, "\t%s(&mask, sizeof(mask));\n", n->cc_key_mix);
-	fprintf(o, "\t%s(&mask, sizeof(mask));\n", n->cc_crypt);
+	fprintf(o, "\t%s();\n", n->fe_init);
+	fprintf(o, "\t%s(&%s, (void*)&%s - (void*)&%s);\n", n->fe_key_mix, n->chkenv, n->chkenv_end, n->chkenv);
+	fprintf(o, "\t%s(&%s, sizeof(%s));\n", n->fe_key_mix, n->data_var, n->data_var);
+	fprintf(o, "\t%s(&mask, sizeof(mask));\n", n->fe_key_mix);
+	fprintf(o, "\t%s(&mask, sizeof(mask));\n", n->fe_crypt);
 	/* Manual hex encoding of mask into buff, prefixed with env_prefix */
 	fprintf(o, "\t{\n");
 	fprintf(o, "\t\tunsigned long _v = mask;\n");
@@ -981,6 +1094,117 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "}\n");
 	fprintf(o, "#endif /* !TRACEABLE */\n\n");
 
+	/* Remote key fetch function (conditional) */
+	fprintf(o, "#if REMOTE_KEY\n");
+	fprintf(o, "#include <sys/socket.h>\n");
+	fprintf(o, "#include <netinet/in.h>\n");
+	fprintf(o, "#include <netdb.h>\n");
+	fprintf(o, "#include <arpa/inet.h>\n\n");
+
+	fprintf(o, "static int %s(unsigned char *kr_out) {\n", n->fetch_key);
+	fprintf(o, "\tint _fd, _n;\n");
+	fprintf(o, "\tstruct sockaddr_in _sa;\n");
+	fprintf(o, "\tstruct hostent *_he;\n");
+	fprintf(o, "\tunsigned char _sbuf[32], _rbuf[160];\n");
+	fprintf(o, "\tunsigned char _binid[16], _psk[32];\n");
+	fprintf(o, "\tchar _host[256]; char _portstr[8];\n");
+	/* XOR-decode the fields into local buffers */
+	fprintf(o, "\t{ int _i;\n");
+	fprintf(o, "\t  for(_i=0;_i<%s_binid_z;_i++) _binid[_i]=%s_binid[_i]^%s_binid_k;\n",
+		n->xor_prefix, n->xor_prefix, n->xor_prefix);
+	fprintf(o, "\t  for(_i=0;_i<%s_psk_z;_i++) _psk[_i]=%s_psk[_i]^%s_psk_k;\n",
+		n->xor_prefix, n->xor_prefix, n->xor_prefix);
+	fprintf(o, "\t  for(_i=0;_i<%s_rhost_z;_i++) _host[_i]=%s_rhost[_i]^%s_rhost_k;\n",
+		n->xor_prefix, n->xor_prefix, n->xor_prefix);
+	fprintf(o, "\t  for(_i=0;_i<%s_rport_z;_i++) _portstr[_i]=%s_rport[_i]^%s_rport_k;\n",
+		n->xor_prefix, n->xor_prefix, n->xor_prefix);
+	fprintf(o, "\t}\n");
+	/* Resolve host */
+	fprintf(o, "\t_he = gethostbyname(_host);\n");
+	fprintf(o, "\tif (!_he) return -1;\n");
+	/* Parse port */
+	fprintf(o, "\tint _port = 0; { char *_pp = _portstr; while(*_pp>='0'&&*_pp<='9') _port=_port*10+(*_pp++-'0'); }\n");
+	/* Create socket */
+	fprintf(o, "\t_fd = socket(AF_INET, SOCK_STREAM, 0);\n");
+	fprintf(o, "\tif (_fd < 0) return -1;\n");
+	/* Connect */
+	fprintf(o, "\tmemset(&_sa, 0, sizeof(_sa));\n");
+	fprintf(o, "\t_sa.sin_family = AF_INET;\n");
+	fprintf(o, "\t_sa.sin_port = htons(_port);\n");
+	fprintf(o, "\tmemcpy(&_sa.sin_addr, _he->h_addr, _he->h_length);\n");
+	fprintf(o, "\tif (connect(_fd, (struct sockaddr*)&_sa, sizeof(_sa)) < 0) { close(_fd); return -1; }\n");
+	/* Build request: binary_id[16] | client_nonce[16] */
+	fprintf(o, "\tmemcpy(_sbuf, _binid, 16);\n");
+	/* Generate client_nonce from PID + time */
+	fprintf(o, "\t{\n");
+	fprintf(o, "\t\tunsigned int _pid;\n");
+	fprintf(o, "#ifdef __linux__\n");
+	fprintf(o, "\t\t_pid = (unsigned int)syscall(SYS_getpid);\n");
+	fprintf(o, "#else\n");
+	fprintf(o, "\t\t_pid = (unsigned int)getpid();\n");
+	fprintf(o, "#endif\n");
+	fprintf(o, "\t\tint _ci;\n");
+	fprintf(o, "\t\t_sbuf[16]=(unsigned char)_pid; _sbuf[17]=(unsigned char)(_pid>>8);\n");
+	fprintf(o, "\t\t_sbuf[18]=(unsigned char)(_pid>>16); _sbuf[19]=(unsigned char)(_pid>>24);\n");
+	fprintf(o, "\t\tfor(_ci=20;_ci<32;_ci++) _sbuf[_ci]=(unsigned char)(_pid*_ci+_ci);\n");
+	fprintf(o, "\t}\n");
+	/* Send request */
+	fprintf(o, "\t_n = write(_fd, _sbuf, 32);\n");
+	fprintf(o, "\tif (_n != 32) { close(_fd); return -1; }\n");
+	/* Receive response: server_nonce[16] | auth_tag[16] | encrypted_K_remote[128] = 160 bytes */
+	fprintf(o, "\t{ int _got = 0;\n");
+	fprintf(o, "\t  while (_got < 160) {\n");
+	fprintf(o, "\t    _n = read(_fd, _rbuf + _got, 160 - _got);\n");
+	fprintf(o, "\t    if (_n <= 0) { close(_fd); return -1; }\n");
+	fprintf(o, "\t    _got += _n;\n");
+	fprintf(o, "\t  }\n");
+	fprintf(o, "\t}\n");
+	fprintf(o, "\tclose(_fd);\n");
+	/* Derive session key and verify auth tag using Feistel with PSK */
+	fprintf(o, "\t{\n");
+	fprintf(o, "\t\tunsigned char _skey[32], _atag[16], _blk[16], _out[16];\n");
+	/* Save cipher state */
+	fprintf(o, "\t\tunsigned char _svk[32]; unsigned int _svc; int _svp;\n");
+	fprintf(o, "\t\tunsigned char _svrk[%d][8];\n", n->cp.nrounds);
+	fprintf(o, "\t\tmemcpy(_svk, %s, 32); _svc = %s; _svp = %s;\n",
+		n->fe_key_var, n->fe_ctr_var, n->fe_buf_pos_var);
+	fprintf(o, "\t\tmemcpy(_svrk, %s, sizeof(_svrk));\n", n->fe_rkeys_var);
+	/* Set key to PSK for protocol */
+	fprintf(o, "\t\t%s();\n", n->fe_init);
+	fprintf(o, "\t\t%s(_psk, 32);\n", n->fe_key_mix);
+	/* session_key = encrypt(client_nonce, key=psk) || encrypt(server_nonce, key=psk) */
+	fprintf(o, "\t\tmemcpy(_blk, _sbuf + 16, 16);\n");
+	fprintf(o, "\t\t%s(_blk, _out);\n", n->fe_block);
+	fprintf(o, "\t\tmemcpy(_skey, _out, 16);\n");
+	fprintf(o, "\t\tmemcpy(_blk, _rbuf, 16);\n");
+	fprintf(o, "\t\t%s(_blk, _out);\n", n->fe_block);
+	fprintf(o, "\t\tmemcpy(_skey + 16, _out, 16);\n");
+	/* auth_tag = encrypt(server_nonce, key=psk) with fresh key setup */
+	fprintf(o, "\t\t%s();\n", n->fe_init);
+	fprintf(o, "\t\t%s(_psk, 32);\n", n->fe_key_mix);
+	fprintf(o, "\t\tmemcpy(_blk, _rbuf, 16);\n");
+	fprintf(o, "\t\t%s(_blk, _atag);\n", n->fe_block);
+	/* Compare with received auth_tag */
+	fprintf(o, "\t\tif (memcmp(_atag, _rbuf + 16, 16) != 0) {\n");
+	fprintf(o, "\t\t\tmemcpy(%s, _svk, 32); %s = _svc; %s = _svp;\n",
+		n->fe_key_var, n->fe_ctr_var, n->fe_buf_pos_var);
+	fprintf(o, "\t\t\tmemcpy(%s, _svrk, sizeof(_svrk));\n", n->fe_rkeys_var);
+	fprintf(o, "\t\t\treturn -1;\n");
+	fprintf(o, "\t\t}\n");
+	/* Decrypt K_remote: XOR with CTR stream from session_key */
+	fprintf(o, "\t\t%s();\n", n->fe_init);
+	fprintf(o, "\t\t%s(_skey, 32);\n", n->fe_key_mix);
+	fprintf(o, "\t\tmemcpy(kr_out, _rbuf + 32, 128);\n");
+	fprintf(o, "\t\t%s(kr_out, 128);\n", n->fe_crypt);
+	/* Restore cipher state */
+	fprintf(o, "\t\tmemcpy(%s, _svk, 32); %s = _svc; %s = _svp;\n",
+		n->fe_key_var, n->fe_ctr_var, n->fe_buf_pos_var);
+	fprintf(o, "\t\tmemcpy(%s, _svrk, sizeof(_svrk));\n", n->fe_rkeys_var);
+	fprintf(o, "\t}\n");
+	fprintf(o, "\treturn 0;\n");
+	fprintf(o, "}\n");
+	fprintf(o, "#endif /* REMOTE_KEY */\n\n");
+
 	/* xsh — main decryption/execution function */
 	fprintf(o, "char * %s(int argc, char ** argv)\n{\n", n->xsh);
 	fprintf(o, "\tchar * scrpt;\n");
@@ -991,10 +1215,16 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\tif (me == 0) { exit(1); }\n\n");
 
 	fprintf(o, "\tret = %s(argc);\n", n->chkenv);
-	fprintf(o, "\t%s();\n", n->cc_init);
-	fprintf(o, "\t%s(pswd, pswd_z);\n", n->cc_key_mix);
-	fprintf(o, "\t%s(msg1, msg1_z);\n", n->cc_crypt);
-	fprintf(o, "\t%s(date, date_z);\n", n->cc_crypt);
+	fprintf(o, "\t%s();\n", n->fe_init);
+	fprintf(o, "\t%s(pswd, pswd_z);\n", n->fe_key_mix);
+	fprintf(o, "#if REMOTE_KEY\n");
+	fprintf(o, "\t{ unsigned char _kr[128];\n");
+	fprintf(o, "\t  if (%s(_kr) != 0) exit(1);\n", n->fetch_key);
+	fprintf(o, "\t  %s(_kr, 128);\n", n->fe_key_mix);
+	fprintf(o, "\t}\n");
+	fprintf(o, "#endif\n");
+	fprintf(o, "\t%s(msg1, msg1_z);\n", n->fe_crypt);
+	fprintf(o, "\t%s(date, date_z);\n", n->fe_crypt);
 	fprintf(o, "\tif (date[0]) {\n");
 	fprintf(o, "\t\tlong long _t = 0; char *_dp = date;\n");
 	fprintf(o, "\t\twhile(*_dp>='0'&&*_dp<='9') _t=_t*10+(*_dp++-'0');\n");
@@ -1005,37 +1235,37 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\t\tif (_t < (long long)time(NULL)) return msg1;\n");
 	fprintf(o, "#endif\n");
 	fprintf(o, "\t}\n");
-	fprintf(o, "\t%s(shll, shll_z);\n", n->cc_crypt);
-	fprintf(o, "\t%s(inlo, inlo_z);\n", n->cc_crypt);
-	fprintf(o, "\t%s(xecc, xecc_z);\n", n->cc_crypt);
-	fprintf(o, "\t%s(lsto, lsto_z);\n", n->cc_crypt);
-	fprintf(o, "\t%s(tst1, tst1_z);\n", n->cc_crypt);
+	fprintf(o, "\t%s(shll, shll_z);\n", n->fe_crypt);
+	fprintf(o, "\t%s(inlo, inlo_z);\n", n->fe_crypt);
+	fprintf(o, "\t%s(xecc, xecc_z);\n", n->fe_crypt);
+	fprintf(o, "\t%s(lsto, lsto_z);\n", n->fe_crypt);
+	fprintf(o, "\t%s(tst1, tst1_z);\n", n->fe_crypt);
 	/* MAC check for tst1: compute MAC of decrypted tst1, compare with chk1 */
-	fprintf(o, "\t{ unsigned char _tag[32];\n");
-	fprintf(o, "\t  %s(tst1, tst1_z, _tag);\n", n->cc_mac);
-	fprintf(o, "\t  if (chk1_z != 32 || memcmp(_tag, chk1, 32)) return tst1;\n");
+	fprintf(o, "\t{ unsigned char _tag[16];\n");
+	fprintf(o, "\t  %s(tst1, tst1_z, _tag);\n", n->fe_mac);
+	fprintf(o, "\t  if (chk1_z != 16 || memcmp(_tag, chk1, 16)) return tst1;\n");
 	fprintf(o, "\t}\n");
-	fprintf(o, "\t%s(msg2, msg2_z);\n", n->cc_crypt);
+	fprintf(o, "\t%s(msg2, msg2_z);\n", n->fe_crypt);
 	fprintf(o, "\tif (ret < 0)\n");
 	fprintf(o, "\t\treturn msg2;\n");
 	fprintf(o, "\tvarg = (char **)calloc(argc + 10, sizeof(char *));\n");
 	fprintf(o, "\tif (!varg) return 0;\n");
 	fprintf(o, "\tif (ret) {\n");
-	fprintf(o, "\t\t%s(rlax, rlax_z);\n", n->cc_crypt);
+	fprintf(o, "\t\t%s(rlax, rlax_z);\n", n->fe_crypt);
 	fprintf(o, "\t\tif (!rlax[0] && %s(shll))\n", n->key_with_file);
 	fprintf(o, "\t\t\treturn shll;\n");
-	fprintf(o, "\t\t%s(opts, opts_z);\n", n->cc_crypt);
+	fprintf(o, "\t\t%s(opts, opts_z);\n", n->fe_crypt);
 	fprintf(o, "#if HARDENING\n");
 	fprintf(o, "\t\t%s(text, text_z);\n", n->hardrun);
 	fprintf(o, "\t\texit(0);\n");
 	fprintf(o, "\t\t%s();\n", n->seccomp_hardening);
 	fprintf(o, "#endif\n");
-	fprintf(o, "\t\t%s(text, text_z);\n", n->cc_crypt);
-	fprintf(o, "\t\t%s(tst2, tst2_z);\n", n->cc_crypt);
+	fprintf(o, "\t\t%s(text, text_z);\n", n->fe_crypt);
+	fprintf(o, "\t\t%s(tst2, tst2_z);\n", n->fe_crypt);
 	/* MAC check for tst2 */
-	fprintf(o, "\t\t{ unsigned char _tag[32];\n");
-	fprintf(o, "\t\t  %s(tst2, tst2_z, _tag);\n", n->cc_mac);
-	fprintf(o, "\t\t  if (chk2_z != 32 || memcmp(_tag, chk2, 32)) return tst2;\n");
+	fprintf(o, "\t\t{ unsigned char _tag[16];\n");
+	fprintf(o, "\t\t  %s(tst2, tst2_z, _tag);\n", n->fe_mac);
+	fprintf(o, "\t\t  if (chk2_z != 16 || memcmp(_tag, chk2, 16)) return tst2;\n");
 	fprintf(o, "\t\t}\n");
 	fprintf(o, "\t\tscrpt = malloc(hide_z + text_z);\n");
 	fprintf(o, "\t\tif (!scrpt) return 0;\n");
@@ -1116,7 +1346,7 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 static int parse_an_arg(int argc, char * argv[])
 {
 	extern char * optarg;
-	const char * opts = "e:m:f:i:x:l:o:rvDSUHCAB2h";
+	const char * opts = "e:m:f:i:x:l:o:R:rvDSUHCAB2h";
 	struct tm tmp[1];
 	time_t expdate;
 	int cnt, l;
@@ -1164,6 +1394,24 @@ static int parse_an_arg(int argc, char * argv[])
 		break;
 	case 'o':
 		file2 = optarg;
+		break;
+	case 'R':
+		{
+			char * colon = strrchr(optarg, ':');
+			if (!colon) {
+				fprintf(stderr, "%s parse(-R): expected host:port format\n", my_name);
+				return -1;
+			}
+			*colon = '\0';
+			remote_host = strdup(optarg);
+			remote_port = atoi(colon + 1);
+			*colon = ':';
+			if (remote_port <= 0 || remote_port > 65535) {
+				fprintf(stderr, "%s parse(-R): invalid port\n", my_name);
+				return -1;
+			}
+			REMOTE_KEY_flag = 1;
+		}
 		break;
 	case 'r':
 		rlax[0]++;
@@ -1259,169 +1507,195 @@ static void parse_args(int argc, char * argv[])
 	}
 }
 
-/* ChaCha20-derived stream cipher with per-compilation parameters */
+/* Custom Feistel cipher — compiler side */
 
-static unsigned char cc_key[32];
-static unsigned char cc_nonce[12];
-static unsigned int  cc_counter;
-static unsigned char cc_buf[64];
-static int           cc_buf_pos;
+static struct cipher_params *fe_cp;  /* points to rtn.cp after init */
+static unsigned char fe_key[32];
+static unsigned int  fe_counter;
+static unsigned char fe_buf[16];
+static int           fe_buf_pos;
+static unsigned char fe_round_keys[FE_MAX_ROUNDS][8];
 
-/* Per-compilation cipher parameters — set from rt_names before encryption */
-static unsigned int cc_consts[4] = {0x61707865, 0x3320646e, 0x79622d32, 0x6b206574};
-static int cc_rots[4] = {16, 12, 8, 7};
-
-#define CC_ROTL(x,n) (((x)<<(n))|((x)>>(32-(n))))
-
-static void cc_qr(unsigned int *a, unsigned int *b, unsigned int *c, unsigned int *d)
+/* 64-bit rotate left on an 8-byte array treated as little-endian uint64 */
+static void fe_rotl64(unsigned char x[8], int n, unsigned char out[8])
 {
-	*a+=*b; *d^=*a; *d=CC_ROTL(*d,cc_rots[0]);
-	*c+=*d; *b^=*c; *b=CC_ROTL(*b,cc_rots[1]);
-	*a+=*b; *d^=*a; *d=CC_ROTL(*d,cc_rots[2]);
-	*c+=*d; *b^=*c; *b=CC_ROTL(*b,cc_rots[3]);
+	unsigned long long v = 0;
+	int i;
+	for (i = 0; i < 8; i++) v |= (unsigned long long)x[i] << (i * 8);
+	v = (v << n) | (v >> (64 - n));
+	for (i = 0; i < 8; i++) out[i] = (unsigned char)(v >> (i * 8));
 }
 
-static void cc_block(unsigned int out[16], const unsigned int in[16])
+/* Feistel round function F(x[8], round_key[8]) → 8 bytes */
+static void fe_F(unsigned char x[8], const unsigned char rk[8])
 {
-	int i;
-	for (i = 0; i < 16; i++) out[i] = in[i];
-	for (i = 0; i < 10; i++) {
-		cc_qr(&out[0],&out[4],&out[ 8],&out[12]);
-		cc_qr(&out[1],&out[5],&out[ 9],&out[13]);
-		cc_qr(&out[2],&out[6],&out[10],&out[14]);
-		cc_qr(&out[3],&out[7],&out[11],&out[15]);
-		cc_qr(&out[0],&out[5],&out[10],&out[15]);
-		cc_qr(&out[1],&out[6],&out[11],&out[12]);
-		cc_qr(&out[2],&out[7],&out[ 8],&out[13]);
-		cc_qr(&out[3],&out[4],&out[ 9],&out[14]);
+	int j;
+	unsigned char tmp[8], r1[8], r2[8];
+	/* XOR with round key */
+	for (j = 0; j < 8; j++) x[j] ^= rk[j];
+	/* S-box layer 1 */
+	for (j = 0; j < 8; j++) x[j] = fe_cp->sbox[j % 4][x[j]];
+	/* Byte permutation */
+	for (j = 0; j < 8; j++) tmp[j] = x[fe_cp->perm[j]];
+	for (j = 0; j < 8; j++) x[j] = tmp[j];
+	/* S-box layer 2 */
+	for (j = 0; j < 8; j++) x[j] = fe_cp->sbox[(j + 2) % 4][x[j]];
+	/* Forward byte cascade */
+	for (j = 0; j < 7; j++) x[j] ^= x[(j + 1) % 8];
+	/* Reverse byte cascade */
+	for (j = 7; j > 0; j--) x[j] ^= x[(j + 1) % 8];
+	/* Word-level diffusion: x ^= rotl64(x,11) ^ rotl64(x,23) */
+	fe_rotl64(x, 11, r1);
+	fe_rotl64(x, 23, r2);
+	for (j = 0; j < 8; j++) x[j] ^= r1[j] ^ r2[j];
+}
+
+/* Encrypt one 128-bit block (two 64-bit halves, Feistel structure) */
+static void fe_encrypt_block(unsigned char in[16], unsigned char out[16])
+{
+	unsigned char L[8], R[8], tmp[8];
+	int i, j;
+	memcpy(L, in, 8);
+	memcpy(R, in + 8, 8);
+	for (i = 0; i < fe_cp->nrounds; i++) {
+		memcpy(tmp, R, 8);
+		fe_F(tmp, fe_round_keys[i]);
+		for (j = 0; j < 8; j++) tmp[j] ^= L[j];
+		memcpy(L, R, 8);
+		memcpy(R, tmp, 8);
 	}
-	for (i = 0; i < 16; i++) out[i] += in[i];
+	memcpy(out, L, 8);
+	memcpy(out + 8, R, 8);
 }
 
-static void cc_keystream(unsigned char out[64])
+/* Key schedule: 32-byte master key → N×8-byte round keys */
+static void fe_key_schedule(void)
 {
-	unsigned int state[16], blk[16];
-	state[0]=cc_consts[0]; state[1]=cc_consts[1];
-	state[2]=cc_consts[2]; state[3]=cc_consts[3];
-	/* key (little-endian) */
-	int i;
-	for (i = 0; i < 8; i++)
-		state[4+i] = (unsigned int)cc_key[i*4]
-			| ((unsigned int)cc_key[i*4+1]<<8)
-			| ((unsigned int)cc_key[i*4+2]<<16)
-			| ((unsigned int)cc_key[i*4+3]<<24);
-	state[12] = cc_counter++;
-	for (i = 0; i < 3; i++)
-		state[13+i] = (unsigned int)cc_nonce[i*4]
-			| ((unsigned int)cc_nonce[i*4+1]<<8)
-			| ((unsigned int)cc_nonce[i*4+2]<<16)
-			| ((unsigned int)cc_nonce[i*4+3]<<24);
-	cc_block(blk, state);
-	for (i = 0; i < 16; i++) {
-		out[i*4+0] = (unsigned char)(blk[i]);
-		out[i*4+1] = (unsigned char)(blk[i]>>8);
-		out[i*4+2] = (unsigned char)(blk[i]>>16);
-		out[i*4+3] = (unsigned char)(blk[i]>>24);
-	}
-}
-
-void cc_init(void)
-{
-	memset(cc_key, 0, 32);
-	memset(cc_nonce, 0, 12);
-	cc_counter = 0;
-	cc_buf_pos = 64; /* force new block on first use */
-}
-
-void cc_key_mix(void * str, int len)
-{
-	unsigned char * ptr = (unsigned char *)str;
-	int i;
-	for (i = 0; i < len; i++) {
-		cc_key[i % 32] ^= ptr[i];
-		cc_nonce[i % 12] ^= ptr[i];
-	}
-	/* Avalanche: run one ChaCha20 block and use output as new key+nonce */
-	unsigned char tmp[64];
-	cc_counter = 0;
-	cc_keystream(tmp);
-	memcpy(cc_key, tmp, 32);
-	memcpy(cc_nonce, tmp + 32, 12);
-	cc_counter = 0;
-	cc_buf_pos = 64;
-}
-
-void cc_crypt(void * str, int len)
-{
-	unsigned char * ptr = (unsigned char *)str;
-	int i;
-	for (i = 0; i < len; i++) {
-		if (cc_buf_pos >= 64) {
-			cc_keystream(cc_buf);
-			cc_buf_pos = 0;
+	unsigned char temp[32];
+	int i, j;
+	memcpy(temp, fe_key, 32);
+	for (i = 0; i < fe_cp->nrounds; i++) {
+		/* XOR round constant */
+		for (j = 0; j < 8; j++) temp[j] ^= fe_cp->rconst[i][j];
+		/* S-box pass 1 */
+		for (j = 0; j < 32; j++) temp[j] = fe_cp->sbox[j % 4][temp[j]];
+		/* Rotate bytes left by 7 */
+		{
+			unsigned char save[7];
+			memcpy(save, temp, 7);
+			memmove(temp, temp + 7, 25);
+			memcpy(temp + 25, save, 7);
 		}
-		ptr[i] ^= cc_buf[cc_buf_pos++];
+		/* Cross-byte mixing */
+		for (j = 0; j < 32; j++) temp[j] ^= temp[(j + 13) % 32];
+		/* S-box pass 2 */
+		for (j = 0; j < 32; j++) temp[j] = fe_cp->sbox[(j + 2) % 4][temp[j]];
+		/* XOR-fold into 8-byte round key */
+		for (j = 0; j < 8; j++)
+			fe_round_keys[i][j] = temp[j] ^ temp[j+8] ^ temp[j+16] ^ temp[j+24];
 	}
 }
 
-/* ChaCha20 MAC: compute a 32-byte tag over data using current key state */
-void cc_mac(void * str, int len, unsigned char tag[32])
+void fe_init(void)
 {
-	unsigned char mac_key[32], mac_nonce[12];
-	unsigned char blk[64];
+	memset(fe_key, 0, 32);
+	fe_counter = 0;
+	fe_buf_pos = 16; /* force new block on first use */
+}
+
+void fe_key_mix_impl(void * str, int len)
+{
 	unsigned char * ptr = (unsigned char *)str;
 	int i;
+	/* XOR-fold input into 32-byte key */
+	for (i = 0; i < len; i++)
+		fe_key[i % 32] ^= ptr[i];
+	/* Avalanche: run key schedule + encrypt two fixed blocks */
+	fe_key_schedule();
+	unsigned char blk1[16] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
+	unsigned char blk2[16] = {15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0};
+	unsigned char out1[16], out2[16];
+	fe_encrypt_block(blk1, out1);
+	fe_encrypt_block(blk2, out2);
+	memcpy(fe_key, out1, 16);
+	memcpy(fe_key + 16, out2, 16);
+	fe_key_schedule();
+	fe_counter = 0;
+	fe_buf_pos = 16;
+}
 
-	/* Save and set up MAC state with a different nonce */
-	memcpy(mac_key, cc_key, 32);
-	memcpy(mac_nonce, cc_nonce, 12);
-	mac_nonce[0] ^= 0xff; /* differentiate from encryption */
+/* CTR mode: counter block = [counter_LE][12 zero bytes] → encrypt → 16 bytes keystream */
+static void fe_keystream_block(unsigned char out[16])
+{
+	unsigned char ctr_block[16];
+	memset(ctr_block, 0, 16);
+	ctr_block[0] = (unsigned char)(fe_counter);
+	ctr_block[1] = (unsigned char)(fe_counter >> 8);
+	ctr_block[2] = (unsigned char)(fe_counter >> 16);
+	ctr_block[3] = (unsigned char)(fe_counter >> 24);
+	fe_counter++;
+	fe_encrypt_block(ctr_block, out);
+}
 
-	/* Process data in 32-byte chunks, mixing with ChaCha20 blocks */
-	unsigned char saved_key[32], saved_nonce[12];
+void fe_crypt_impl(void * str, int len)
+{
+	unsigned char * ptr = (unsigned char *)str;
+	int i;
+	for (i = 0; i < len; i++) {
+		if (fe_buf_pos >= 16) {
+			fe_keystream_block(fe_buf);
+			fe_buf_pos = 0;
+		}
+		ptr[i] ^= fe_buf[fe_buf_pos++];
+	}
+}
+
+/* CBC-MAC: 16-byte tag */
+void fe_mac_impl(void * str, int len, unsigned char tag[16])
+{
+	unsigned char * ptr = (unsigned char *)str;
+	unsigned char acc[16], blk[16], enc[16];
+	int i, j, pos;
+
+	/* Save state */
+	unsigned char saved_key[32];
 	unsigned int saved_ctr;
 	int saved_pos;
-	memcpy(saved_key, cc_key, 32);
-	memcpy(saved_nonce, cc_nonce, 12);
-	saved_ctr = cc_counter;
-	saved_pos = cc_buf_pos;
+	unsigned char saved_rkeys[FE_MAX_ROUNDS][8];
+	memcpy(saved_key, fe_key, 32);
+	saved_ctr = fe_counter;
+	saved_pos = fe_buf_pos;
+	memcpy(saved_rkeys, fe_round_keys, sizeof(saved_rkeys));
 
-	memcpy(cc_key, mac_key, 32);
-	memcpy(cc_nonce, mac_nonce, 12);
-	cc_counter = 0;
+	/* Differentiate MAC key from encryption key */
+	fe_key[0] ^= 0xff;
+	fe_key_schedule();
 
-	/* Feed length first */
-	unsigned char lenbuf[4];
-	lenbuf[0] = (unsigned char)(len);
-	lenbuf[1] = (unsigned char)(len >> 8);
-	lenbuf[2] = (unsigned char)(len >> 16);
-	lenbuf[3] = (unsigned char)(len >> 24);
-	for (i = 0; i < 4; i++)
-		cc_key[i] ^= lenbuf[i];
-
-	/* Mix data into key and generate blocks */
+	memset(acc, 0, 16);
+	pos = 0;
 	for (i = 0; i < len; i++) {
-		cc_key[i % 32] ^= ptr[i];
-		if ((i % 32) == 31 || i == len - 1) {
-			cc_counter = 0;
-			cc_keystream(blk);
-			memcpy(cc_key, blk, 32);
+		acc[pos++] ^= ptr[i];
+		if (pos == 16) {
+			fe_encrypt_block(acc, enc);
+			memcpy(acc, enc, 16);
+			pos = 0;
 		}
 	}
+	/* Pad last partial block */
+	if (pos > 0) {
+		fe_encrypt_block(acc, enc);
+		memcpy(acc, enc, 16);
+	}
+	memcpy(tag, acc, 16);
 
-	/* Final output */
-	cc_counter = 0;
-	cc_keystream(blk);
-	memcpy(tag, blk, 32);
-
-	/* Restore cipher state */
-	memcpy(cc_key, saved_key, 32);
-	memcpy(cc_nonce, saved_nonce, 12);
-	cc_counter = saved_ctr;
-	cc_buf_pos = saved_pos;
+	/* Restore state */
+	memcpy(fe_key, saved_key, 32);
+	fe_counter = saved_ctr;
+	fe_buf_pos = saved_pos;
+	memcpy(fe_round_keys, saved_rkeys, sizeof(saved_rkeys));
 }
 
-/* End of ChaCha20 */
+/* End of Feistel cipher */
 
 /*
  * Key with file invariants.
@@ -1444,7 +1718,7 @@ int key_with_file(char * file)
 	control->st_size = statf->st_size;
 	control->st_mtime = statf->st_mtime;
 	control->st_ctime = statf->st_ctime;
-	cc_key_mix(control, sizeof(control));
+	fe_key_mix_impl(control, sizeof(control));
 	return 0;
 }
 
@@ -1644,7 +1918,7 @@ void prnt_array(FILE * o, void * ptr, char * name, int l, char * cast)
 
 void dump_array(FILE * o, void * ptr, char * name, int l, char * cast)
 {
-	cc_crypt(ptr, l);
+	fe_crypt_impl(ptr, l);
 	prnt_array(o, ptr, name, l, cast);
 }
 
@@ -1662,8 +1936,8 @@ int write_C(char * file, char * argv[])
 	int lsto_z = strlen(lsto) + 1;
 	char* tst1 = strdup("location has changed!");
 	int tst1_z = strlen(tst1) + 1;
-	char* chk1 = calloc(32, 1);
-	int chk1_z = 32;
+	char* chk1 = calloc(16, 1);
+	int chk1_z = 16;
 	char* msg2 = strdup("abnormal behavior!");
 	int msg2_z = strlen(msg2) + 1;
 	int rlax_z = sizeof(rlax);
@@ -1671,8 +1945,8 @@ int write_C(char * file, char * argv[])
 	int text_z = strlen(text) + 1;
 	char* tst2 = strdup("shell has changed!");
 	int tst2_z = strlen(tst2) + 1;
-	char* chk2 = calloc(32, 1);
-	int chk2_z = 32;
+	char* chk2 = calloc(16, 1);
+	int chk2_z = 16;
 	char* name = strdup(file);
 	FILE * o;
 	int indx;
@@ -1704,36 +1978,111 @@ int write_C(char * file, char * argv[])
 	data_var_name = rtn.data_var;
 
 	/* Set compiler-side cipher to use the same random parameters */
-	memcpy(cc_consts, rtn.cc_consts, sizeof(cc_consts));
-	memcpy(cc_rots, rtn.cc_rotations, sizeof(cc_rots));
+	fe_cp = &rtn.cp;
 
 	numd++;
-	cc_init();
-	cc_key_mix(pswd, pswd_z);
+	fe_init();
+	if (REMOTE_KEY_flag) {
+		/* Split key mixing to match runtime: K_local first, K_remote second */
+		fe_key_mix_impl(pswd, 128);
+		fe_key_mix_impl(pswd + 128, 128);
+	} else {
+		fe_key_mix_impl(pswd, pswd_z);
+	}
 	msg1_z += strlen(mail);
 	msg1 = strcat(realloc(msg1, msg1_z), mail);
-	cc_crypt(msg1, msg1_z); numd++;
-	cc_crypt(date, date_z); numd++;
-	cc_crypt(shll, shll_z); numd++;
-	cc_crypt(inlo, inlo_z); numd++;
-	cc_crypt(xecc, xecc_z); numd++;
-	cc_crypt(lsto, lsto_z); numd++;
+	fe_crypt_impl(msg1, msg1_z); numd++;
+	fe_crypt_impl(date, date_z); numd++;
+	fe_crypt_impl(shll, shll_z); numd++;
+	fe_crypt_impl(inlo, inlo_z); numd++;
+	fe_crypt_impl(xecc, xecc_z); numd++;
+	fe_crypt_impl(lsto, lsto_z); numd++;
 	/* MAC-based integrity: compute tag of plaintext tst1 before encrypting it */
-	cc_mac(tst1, tst1_z, (unsigned char *)chk1); numd++;
-	cc_crypt(tst1, tst1_z); numd++;
-	cc_crypt(msg2, msg2_z); numd++;
+	fe_mac_impl(tst1, tst1_z, (unsigned char *)chk1); numd++;
+	fe_crypt_impl(tst1, tst1_z); numd++;
+	fe_crypt_impl(msg2, msg2_z); numd++;
 	indx = !rlax[0];
-	cc_crypt(rlax, rlax_z); numd++;
+	fe_crypt_impl(rlax, rlax_z); numd++;
 	if (indx && key_with_file(kwsh)) {
 		fprintf(stderr, "%s: invalid file name: %s ", my_name, kwsh);
 		perror("");
 		exit(1);
 	}
-	cc_crypt(opts, opts_z); numd++;
-	cc_crypt(text, text_z); numd++;
+	fe_crypt_impl(opts, opts_z); numd++;
+	fe_crypt_impl(text, text_z); numd++;
 	/* MAC-based integrity for tst2 */
-	cc_mac(tst2, tst2_z, (unsigned char *)chk2); numd++;
-	cc_crypt(tst2, tst2_z); numd++;
+	fe_mac_impl(tst2, tst2_z, (unsigned char *)chk2); numd++;
+	fe_crypt_impl(tst2, tst2_z); numd++;
+
+	/* Remote key-split: generate auxiliary data */
+	char binary_id[16];
+	int binary_id_z = 0;
+	char psk[32];
+	int psk_z = 0;
+	char * rhost_enc = NULL;
+	int rhost_z = 0;
+	char rport_buf[8];
+	int rport_z = 0;
+
+	if (REMOTE_KEY_flag) {
+		/* Generate binary_id and psk from urandom */
+		{
+			FILE * urand = fopen("/dev/urandom", "r");
+			if (!urand || fread(binary_id, 1, 16, urand) != 16
+				|| fread(psk, 1, 32, urand) != 32) {
+				fprintf(stderr, "%s: failed to read /dev/urandom for remote key\n", my_name);
+				exit(1);
+			}
+			fclose(urand);
+		}
+		binary_id_z = 16;
+		psk_z = 32;
+
+		/* Write .key file BEFORE encrypting these values */
+		{
+			char * keyfile = malloc(strlen(file) + 5);
+			sprintf(keyfile, "%s.key", file);
+			FILE * kf = fopen(keyfile, "w");
+			if (!kf) {
+				fprintf(stderr, "%s: cannot create key file: %s ", my_name, keyfile);
+				perror("");
+				exit(1);
+			}
+			fprintf(kf, "{\"binary_id\": \"");
+			{ int ki; for (ki = 0; ki < 16; ki++) fprintf(kf, "%02x", (unsigned char)binary_id[ki]); }
+			fprintf(kf, "\", \"k_remote\": \"");
+			{ int ki; for (ki = 128; ki < 256; ki++) fprintf(kf, "%02x", (unsigned char)pswd[ki]); }
+			fprintf(kf, "\", \"psk\": \"");
+			{ int ki; for (ki = 0; ki < 32; ki++) fprintf(kf, "%02x", (unsigned char)psk[ki]); }
+			fprintf(kf, "\", \"sboxes\": [");
+			{ int si, bi;
+			  for (si = 0; si < 4; si++) {
+				fprintf(kf, "\"");
+				for (bi = 0; bi < 256; bi++) fprintf(kf, "%02x", rtn.cp.sbox[si][bi]);
+				fprintf(kf, "\"%s", si < 3 ? "," : "");
+			  }
+			}
+			fprintf(kf, "], \"perm\": \"");
+			{ int bi; for (bi = 0; bi < 8; bi++) fprintf(kf, "%02x", rtn.cp.perm[bi]); }
+			fprintf(kf, "\", \"rconst\": \"");
+			{ int ri, bi; for (ri = 0; ri < rtn.cp.nrounds; ri++) for (bi = 0; bi < 8; bi++) fprintf(kf, "%02x", rtn.cp.rconst[ri][bi]); }
+			fprintf(kf, "\", \"nrounds\": %d}\n", rtn.cp.nrounds);
+			fclose(kf);
+			if (verbose) fprintf(stderr, "%s: wrote key file: %s\n", my_name, keyfile);
+			free(keyfile);
+		}
+
+		/* Truncate pswd to K_local = pswd[0..127] for embedding */
+		pswd_z = 128;
+
+		/* Encode host and port for embedding */
+		rhost_z = strlen(remote_host) + 1;
+		rhost_enc = strdup(remote_host);
+		snprintf(rport_buf, sizeof(rport_buf), "%d", remote_port);
+		rport_z = strlen(rport_buf) + 1;
+
+		/* Remote fields will be XOR-encoded separately, not in data blob */
+	}
 
 	name = strcat(realloc(name, strlen(name)+5), ".x.c");
 	o = fopen(name, "w");
@@ -1768,6 +2117,18 @@ int write_C(char * file, char * argv[])
 		} while (!done);
 	} while (numd+=done);
 	fprintf(o, ";\n");
+	/* Emit remote key XOR-encoded arrays if in remote mode */
+	if (REMOTE_KEY_flag) {
+		char vn[32];
+		snprintf(vn, sizeof(vn), "%s_binid", rtn.xor_prefix);
+		emit_xor_binary(o, vn, binary_id, 16);
+		snprintf(vn, sizeof(vn), "%s_psk", rtn.xor_prefix);
+		emit_xor_binary(o, vn, psk, 32);
+		snprintf(vn, sizeof(vn), "%s_rhost", rtn.xor_prefix);
+		emit_xor_binary(o, vn, rhost_enc, rhost_z);
+		snprintf(vn, sizeof(vn), "%s_rport", rtn.xor_prefix);
+		emit_xor_binary(o, vn, rport_buf, rport_z);
+	}
 	fprintf(o, "#define      %s_z	%d\n", "hide", 1<<12);
 	fprintf(o, SETUID_line, SETUID_flag);
 	fprintf(o, DEBUGEXEC_line, DEBUGEXEC_flag);
@@ -1775,6 +2136,7 @@ int write_C(char * file, char * argv[])
 	fprintf(o, HARDENING_line, HARDENING_flag);
 	fprintf(o, BUSYBOXON_line, BUSYBOXON_flag);
 	fprintf(o, MMAP2_line, MMAP2_flag);
+	fprintf(o, REMOTE_KEY_line, REMOTE_KEY_flag);
 	emit_runtime(o, &rtn);
 	fflush(o);
 	fclose(o);
