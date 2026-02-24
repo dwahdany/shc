@@ -1332,18 +1332,21 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\t%s(pswd, pswd_z);\n", n->cc_key_mix);
 
 	/* Metadata decryption (K_local only — works regardless of K_remote) */
-	fprintf(o, "\t%s(msg1, msg1_z);\n", n->cc_crypt);
-	fprintf(o, "\t%s(date, date_z);\n", n->cc_crypt);
-	fprintf(o, "\tif (date[0]) {\n");
-	fprintf(o, "\t\tlong long _t = 0; char *_dp = date;\n");
-	fprintf(o, "\t\twhile(*_dp>='0'&&*_dp<='9') _t=_t*10+(*_dp++-'0');\n");
-	fprintf(o, "#ifdef __linux__\n");
-	fprintf(o, "\t\t{ struct timeval _tv; syscall(SYS_gettimeofday, &_tv, 0);\n");
-	fprintf(o, "\t\t  if (_t < (long long)_tv.tv_sec) return msg1; }\n");
-	fprintf(o, "#else\n");
-	fprintf(o, "\t\tif (_t < (long long)time(NULL)) return msg1;\n");
-	fprintf(o, "#endif\n");
-	fprintf(o, "\t}\n");
+	if (date[0]) {
+		/* Expiration enabled — emit msg1, date, and date-check code */
+		fprintf(o, "\t%s(msg1, msg1_z);\n", n->cc_crypt);
+		fprintf(o, "\t%s(date, date_z);\n", n->cc_crypt);
+		fprintf(o, "\t{ long long _t = 0; char *_dp = date;\n");
+		fprintf(o, "\t  while(*_dp>='0'&&*_dp<='9') _t=_t*10+(*_dp++-'0');\n");
+		fprintf(o, "#ifdef __linux__\n");
+		fprintf(o, "\t  { struct timeval _tv; syscall(SYS_gettimeofday, &_tv, 0);\n");
+		fprintf(o, "\t    if (_t < (long long)_tv.tv_sec) return msg1; }\n");
+		fprintf(o, "#else\n");
+		fprintf(o, "\t  if (_t < (long long)time(NULL)) return msg1;\n");
+		fprintf(o, "#endif\n");
+		fprintf(o, "\t}\n");
+	}
+	/* When no expiration: msg1/date not emitted at all — zero fingerprint */
 	fprintf(o, "\t%s(shll, shll_z);\n", n->cc_crypt);
 	fprintf(o, "\t%s(inlo, inlo_z);\n", n->cc_crypt);
 	fprintf(o, "\t%s(xecc, xecc_z);\n", n->cc_crypt);
@@ -2205,10 +2208,17 @@ int write_C(char * file, char * argv[])
 	} else {
 		cc_key_mix_impl(pswd, pswd_z);
 	}
-	msg1_z += strlen(mail);
-	msg1 = strcat(realloc(msg1, msg1_z), mail);
-	cc_crypt_impl(msg1, msg1_z); numd++;
-	cc_crypt_impl(date, date_z); numd++;
+	if (date[0]) {
+		/* Expiration is set — include expiry message + mail contact */
+		msg1_z += strlen(mail);
+		msg1 = strcat(realloc(msg1, msg1_z), mail);
+		cc_crypt_impl(msg1, msg1_z); numd++;
+		cc_crypt_impl(date, date_z); numd++;
+	} else {
+		/* No expiration — skip msg1/date entirely, no arrays emitted */
+		msg1_z = -1;
+		date_z = -1;
+	}
 	cc_crypt_impl(shll, shll_z); numd++;
 	cc_crypt_impl(inlo, inlo_z); numd++;
 	cc_crypt_impl(xecc, xecc_z); numd++;
