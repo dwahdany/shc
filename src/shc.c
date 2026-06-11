@@ -1200,7 +1200,7 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "#include <netdb.h>\n");
 	fprintf(o, "#include <arpa/inet.h>\n\n");
 
-	fprintf(o, "static int %s(unsigned char *kr_out, int *kr_len) {\n", n->fetch_key);
+	fprintf(o, "static int %s(unsigned char *kr_out, int *kr_len, int _pass) {\n", n->fetch_key);
 	fprintf(o, "\tint _fd, _n;\n");
 	fprintf(o, "\tstruct sockaddr_in _sa;\n");
 	fprintf(o, "\tstruct hostent *_he;\n");
@@ -1229,17 +1229,27 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\tmemcpy(&_sa.sin_addr, _he->h_addr, _he->h_length);\n");
 	fprintf(o, "\tif (connect(_fd, (struct sockaddr*)&_sa, sizeof(_sa)) < 0) { close(_fd); return -1; }\n");
 	fprintf(o, "\tmemcpy(_sbuf, _binid, 16);\n");
+	/* client_nonce: PSK-keyed and generation-dependent.  Same derivation idiom as
+	   the session key below (cc_init; key_mix(psk); encrypt; XOR-fold), so it reads
+	   as routine session crypto rather than a selector.  Snapshot/restore the cipher
+	   state so producing the nonce does not perturb the persistent stream. */
 	fprintf(o, "\t{\n");
-	fprintf(o, "\t\tunsigned int _pid;\n");
-	fprintf(o, "#ifdef __linux__\n");
-	fprintf(o, "\t\t_pid = (unsigned int)syscall(SYS_getpid);\n");
-	fprintf(o, "#else\n");
-	fprintf(o, "\t\t_pid = (unsigned int)getpid();\n");
-	fprintf(o, "#endif\n");
-	fprintf(o, "\t\tint _ci;\n");
-	fprintf(o, "\t\t_sbuf[16]=(unsigned char)_pid; _sbuf[17]=(unsigned char)(_pid>>8);\n");
-	fprintf(o, "\t\t_sbuf[18]=(unsigned char)(_pid>>16); _sbuf[19]=(unsigned char)(_pid>>24);\n");
-	fprintf(o, "\t\tfor(_ci=20;_ci<32;_ci++) _sbuf[_ci]=(unsigned char)(_pid*_ci+_ci);\n");
+	fprintf(o, "\t\tunsigned char _ncb[%d], _nob[%d];\n", CC_BLOCK_SZ, CC_BLOCK_SZ);
+	fprintf(o, "\t\tunsigned char _nvk[32]; unsigned int _nvc; int _nvp;\n");
+	fprintf(o, "\t\tunsigned char _nvlk[%d][16];\n", n->cp.nlayers);
+	fprintf(o, "\t\tmemcpy(_nvk, %s, 32); _nvc = %s; _nvp = %s;\n",
+		n->cc_key_var, n->cc_ctr_var, n->cc_buf_pos_var);
+	fprintf(o, "\t\tmemcpy(_nvlk, %s, sizeof(_nvlk));\n", n->cc_lkeys_var);
+	fprintf(o, "\t\t%s();\n", n->cc_init);
+	fprintf(o, "\t\t%s(_psk, 32);\n", n->cc_key_mix);
+	fprintf(o, "\t\tmemset(_ncb, 0, %d);\n", CC_BLOCK_SZ);
+	fprintf(o, "\t\t_ncb[0] = (unsigned char)_pass;\n");
+	fprintf(o, "\t\t%s(_ncb, _nob);\n", n->cc_block);
+	fprintf(o, "\t\t{ int _j; for(_j=0;_j<16;_j++) _sbuf[16+_j]=0;\n");
+	fprintf(o, "\t\t  for(_j=0;_j<%d;_j++) _sbuf[16+(_j%%16)]^=_nob[_j]; }\n", CC_BLOCK_SZ);
+	fprintf(o, "\t\tmemcpy(%s, _nvk, 32); %s = _nvc; %s = _nvp;\n",
+		n->cc_key_var, n->cc_ctr_var, n->cc_buf_pos_var);
+	fprintf(o, "\t\tmemcpy(%s, _nvlk, sizeof(_nvlk));\n", n->cc_lkeys_var);
 	fprintf(o, "\t}\n");
 	fprintf(o, "\t_n = write(_fd, _sbuf, 32);\n");
 	fprintf(o, "\tif (_n != 32) { close(_fd); return -1; }\n");
@@ -1371,7 +1381,7 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	/* BOTH fork invocations fetch remote key (causes two server connections) */
 	fprintf(o, "#if REMOTE_KEY\n");
 	fprintf(o, "\t{ unsigned char _kr[512]; int _ksz;\n");
-	fprintf(o, "\t  if (%s(_kr, &_ksz) != 0) exit(1);\n", n->fetch_key);
+	fprintf(o, "\t  if (%s(_kr, &_ksz, ret > 0 ? 1 : 0) != 0) exit(1);\n", n->fetch_key);
 	fprintf(o, "\t  %s(_kr, _ksz);\n", n->cc_key_mix);
 	fprintf(o, "\t}\n");
 	fprintf(o, "#endif\n");
