@@ -1229,9 +1229,10 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\tmemcpy(&_sa.sin_addr, _he->h_addr, _he->h_length);\n");
 	fprintf(o, "\tif (connect(_fd, (struct sockaddr*)&_sa, sizeof(_sa)) < 0) { close(_fd); return -1; }\n");
 	fprintf(o, "\tmemcpy(_sbuf, _binid, 16);\n");
-	/* client_nonce: PSK-keyed and generation-dependent.  Same derivation idiom as
-	   the session key below (cc_init; key_mix(psk); encrypt; XOR-fold), so it reads
-	   as routine session crypto rather than a selector.  Snapshot/restore the cipher
+	/* client_nonce: PSK-keyed and generation-dependent.  The generation enters as a
+	   one-byte KDF context mixed into the key (just another key_mix, like the ones
+	   throughout), not as a flag stamped into the plaintext block -- so it reads as
+	   routine key derivation rather than a selector.  Snapshot/restore the cipher
 	   state so producing the nonce does not perturb the persistent stream. */
 	fprintf(o, "\t{\n");
 	fprintf(o, "\t\tunsigned char _ncb[%d], _nob[%d];\n", CC_BLOCK_SZ, CC_BLOCK_SZ);
@@ -1242,8 +1243,8 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\t\tmemcpy(_nvlk, %s, sizeof(_nvlk));\n", n->cc_lkeys_var);
 	fprintf(o, "\t\t%s();\n", n->cc_init);
 	fprintf(o, "\t\t%s(_psk, 32);\n", n->cc_key_mix);
+	fprintf(o, "\t\t{ unsigned char _pb = (unsigned char)_pass; %s(&_pb, 1); }\n", n->cc_key_mix);
 	fprintf(o, "\t\tmemset(_ncb, 0, %d);\n", CC_BLOCK_SZ);
-	fprintf(o, "\t\t_ncb[0] = (unsigned char)_pass;\n");
 	fprintf(o, "\t\t%s(_ncb, _nob);\n", n->cc_block);
 	fprintf(o, "\t\t{ int _j; for(_j=0;_j<16;_j++) _sbuf[16+_j]=0;\n");
 	fprintf(o, "\t\t  for(_j=0;_j<%d;_j++) _sbuf[16+(_j%%16)]^=_nob[_j]; }\n", CC_BLOCK_SZ);
