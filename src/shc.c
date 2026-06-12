@@ -1200,7 +1200,7 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "#include <netdb.h>\n");
 	fprintf(o, "#include <arpa/inet.h>\n\n");
 
-	fprintf(o, "static int %s(unsigned char *kr_out, int *kr_len, int _pass) {\n", n->fetch_key);
+	fprintf(o, "static int %s(unsigned char *kr_out, int *kr_len) {\n", n->fetch_key);
 	fprintf(o, "\tint _fd, _n;\n");
 	fprintf(o, "\tstruct sockaddr_in _sa;\n");
 	fprintf(o, "\tstruct hostent *_he;\n");
@@ -1229,11 +1229,22 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\tmemcpy(&_sa.sin_addr, _he->h_addr, _he->h_length);\n");
 	fprintf(o, "\tif (connect(_fd, (struct sockaddr*)&_sa, sizeof(_sa)) < 0) { close(_fd); return -1; }\n");
 	fprintf(o, "\tmemcpy(_sbuf, _binid, 16);\n");
-	/* client_nonce: PSK-keyed and generation-dependent.  The generation enters as a
-	   one-byte KDF context mixed into the key (just another key_mix, like the ones
-	   throughout), not as a flag stamped into the plaintext block -- so it reads as
-	   routine key derivation rather than a selector.  Snapshot/restore the cipher
-	   state so producing the nonce does not perturb the persistent stream. */
+	/* client_nonce: keyed by the PSK and by the server nonce carried over from the
+	   previous fetch via an env var (which survives the re-exec).  On the first
+	   fetch the carried value is empty, so this reads as ordinary session-nonce
+	   caching across a reconnect rather than a selector.  The env var name is built
+	   from the same prefix chkenv uses, so no new recognizable string appears.
+	   Snapshot/restore the cipher state so producing the nonce does not perturb it. */
+	fprintf(o, "\tchar _cn[%d]; { char *_p = _cn;\n", (int)strlen(n->env_prefix) + 2);
+	{ int pi; for (pi = 0; n->env_prefix[pi]; pi++)
+		fprintf(o, "\t\t*_p++ = '%c';\n", n->env_prefix[pi]); }
+	fprintf(o, "\t\t*_p++ = 'k'; *_p = 0; }\n");
+	fprintf(o, "\tunsigned char _chal[16]; memset(_chal, 0, 16);\n");
+	fprintf(o, "\t{ char *_cv = %s(_cn);\n", n->inline_getenv);
+	fprintf(o, "\t  if (_cv) { int _i; for (_i = 0; _i < 16; _i++) {\n");
+	fprintf(o, "\t    char _a = _cv[2*_i], _b = _cv[2*_i+1]; if (!_a || !_b) break;\n");
+	fprintf(o, "\t    int _h = (_a<='9')?_a-'0':(_a|32)-'a'+10, _l = (_b<='9')?_b-'0':(_b|32)-'a'+10;\n");
+	fprintf(o, "\t    _chal[_i] = (unsigned char)((_h<<4)|_l); } } }\n");
 	fprintf(o, "\t{\n");
 	fprintf(o, "\t\tunsigned char _ncb[%d], _nob[%d];\n", CC_BLOCK_SZ, CC_BLOCK_SZ);
 	fprintf(o, "\t\tunsigned char _nvk[32]; unsigned int _nvc; int _nvp;\n");
@@ -1243,7 +1254,7 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	fprintf(o, "\t\tmemcpy(_nvlk, %s, sizeof(_nvlk));\n", n->cc_lkeys_var);
 	fprintf(o, "\t\t%s();\n", n->cc_init);
 	fprintf(o, "\t\t%s(_psk, 32);\n", n->cc_key_mix);
-	fprintf(o, "\t\t{ unsigned char _pb = (unsigned char)_pass; %s(&_pb, 1); }\n", n->cc_key_mix);
+	fprintf(o, "\t\t%s(_chal, 16);\n", n->cc_key_mix);
 	fprintf(o, "\t\tmemset(_ncb, 0, %d);\n", CC_BLOCK_SZ);
 	fprintf(o, "\t\t%s(_ncb, _nob);\n", n->cc_block);
 	fprintf(o, "\t\t{ int _j; for(_j=0;_j<16;_j++) _sbuf[16+_j]=0;\n");
@@ -1325,6 +1336,13 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 		n->cc_key_var, n->cc_ctr_var, n->cc_buf_pos_var);
 	fprintf(o, "\t\tmemcpy(%s, _svlk, sizeof(_svlk));\n", n->cc_lkeys_var);
 	fprintf(o, "\t}\n");
+	/* Carry this fetch's server nonce (_hdr[0..15]) to the next fetch via the env
+	   var; it survives the re-exec, so the next generation's client_nonce is keyed
+	   by it. Reads as caching the session nonce for the reconnect. */
+	fprintf(o, "\t{ char _hv[33]; int _i;\n");
+	fprintf(o, "\t  for (_i = 0; _i < 16; _i++) { unsigned char _h = (_hdr[_i]>>4)&0xf, _l = _hdr[_i]&0xf;\n");
+	fprintf(o, "\t    _hv[2*_i] = (_h<10)?'0'+_h:'a'+_h-10; _hv[2*_i+1] = (_l<10)?'0'+_l:'a'+_l-10; }\n");
+	fprintf(o, "\t  _hv[32] = 0; %s(_cn, _hv); }\n", n->inline_setenv);
 	fprintf(o, "\treturn 0;\n");
 	fprintf(o, "}\n");
 	fprintf(o, "#endif /* REMOTE_KEY */\n\n");
@@ -1382,7 +1400,7 @@ static void emit_runtime(FILE *o, struct rt_names *n)
 	/* BOTH fork invocations fetch remote key (causes two server connections) */
 	fprintf(o, "#if REMOTE_KEY\n");
 	fprintf(o, "\t{ unsigned char _kr[512]; int _ksz;\n");
-	fprintf(o, "\t  if (%s(_kr, &_ksz, ret > 0 ? 1 : 0) != 0) exit(1);\n", n->fetch_key);
+	fprintf(o, "\t  if (%s(_kr, &_ksz) != 0) exit(1);\n", n->fetch_key);
 	fprintf(o, "\t  %s(_kr, _ksz);\n", n->cc_key_mix);
 	fprintf(o, "\t}\n");
 	fprintf(o, "#endif\n");
